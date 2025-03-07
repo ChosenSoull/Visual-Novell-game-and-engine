@@ -21,6 +21,14 @@
 #include <queue>
 #include <nlohmann/json.hpp>
 
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
+}
+
 using json = nlohmann::json;
 
 struct VulcanImage {
@@ -47,6 +55,13 @@ struct DisplayImage {
 
 class VisualNovelEngine {
 private:
+    enum class GameState {
+        MENU,
+        GAME,
+        PAUSE
+    };
+    GameState currentState = GameState::MENU;
+
     bool isRunning;
     bool useVulkan;
     int volume, pan;
@@ -73,6 +88,7 @@ private:
     std::map<std::string, TTF_Font*> fonts;
     std::map<std::string, SDL_Texture*> textures;
     std::map<std::string, Mix_Chunk*> sounds;
+    std::map<std::string, Mix_Music*> music;
     std::map<std::string, SDL_Surface*> loadedSurfaces;
     std::map<std::string, VulcanImage> vulcanImages;
     std::queue<std::string> loadQueue;
@@ -81,7 +97,10 @@ private:
     size_t currentCommand = 0;
     bool advanceStory = false;
     bool isWaitingForInput = false;
+    bool isVideoPlaying = false;
     std::vector<DisplayImage> imagesToDisplay;
+    std::vector<DisplayImage> menuImages;
+    std::vector<DisplayImage> pauseImages;
     VkDescriptorSetLayout descriptorSetLayout;
     VkPipelineLayout pipelineLayout;
     VkPipeline graphicsPipeline;
@@ -104,10 +123,7 @@ private:
 
     std::vector<char> readFile(const std::string& filename) {
         std::ifstream file(filename, std::ios::ate | std::ios::binary);
-        if (!file.is_open()) {
-            logError("Failed to open file", filename);
-            throw std::runtime_error("Could not open file: " + filename);
-        }
+        if (!file.is_open()) throw std::runtime_error("Could not open file: " + filename);
         size_t size = file.tellg();
         std::vector<char> buffer(size);
         file.seekg(0);
@@ -122,9 +138,7 @@ private:
         createInfo.codeSize = code.size();
         createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
         VkShaderModule module;
-        VkResult result = vkCreateShaderModule(device, &createInfo, nullptr, &module);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create shader module", "Vulkan error code: " + std::to_string(result));
+        if (vkCreateShaderModule(device, &createInfo, nullptr, &module) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create shader module");
         }
         return module;
@@ -138,7 +152,6 @@ private:
                 return i;
             }
         }
-        logError("Failed to find suitable memory type", "No matching memory type found");
         throw std::runtime_error("Failed to find suitable memory type");
     }
 
@@ -148,9 +161,7 @@ private:
         bufferInfo.size = size;
         bufferInfo.usage = usage;
         bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        VkResult result = vkCreateBuffer(device, &bufferInfo, nullptr, &buffer);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create buffer", "Vulkan error code: " + std::to_string(result));
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create buffer");
         }
 
@@ -161,17 +172,10 @@ private:
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocInfo.allocationSize = memRequirements.size;
         allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
-        result = vkAllocateMemory(device, &allocInfo, nullptr, &bufferMemory);
-        if (result != VK_SUCCESS) {
-            logError("Failed to allocate buffer memory", "Vulkan error code: " + std::to_string(result));
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
             throw std::runtime_error("Failed to allocate buffer memory");
         }
-
-        result = vkBindBufferMemory(device, buffer, bufferMemory, 0);
-        if (result != VK_SUCCESS) {
-            logError("Failed to bind buffer memory", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to bind buffer memory");
-        }
+        vkBindBufferMemory(device, buffer, bufferMemory, 0);
     }
 
     void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory) {
@@ -189,9 +193,7 @@ private:
         imageInfo.usage = usage;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        VkResult result = vkCreateImage(device, &imageInfo, nullptr, &image);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create image", "Vulkan error code: " + std::to_string(result));
+        if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create image");
         }
 
@@ -202,17 +204,10 @@ private:
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocInfo.allocationSize = memRequirements.size;
         allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
-        result = vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory);
-        if (result != VK_SUCCESS) {
-            logError("Failed to allocate image memory", "Vulkan error code: " + std::to_string(result));
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
             throw std::runtime_error("Failed to allocate image memory");
         }
-
-        result = vkBindImageMemory(device, image, imageMemory, 0);
-        if (result != VK_SUCCESS) {
-            logError("Failed to bind image memory", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to bind image memory");
-        }
+        vkBindImageMemory(device, image, imageMemory, 0);
     }
 
     void transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout) {
@@ -230,9 +225,7 @@ private:
         barrier.subresourceRange.baseArrayLayer = 0;
         barrier.subresourceRange.layerCount = 1;
 
-        VkPipelineStageFlags sourceStage;
-        VkPipelineStageFlags destinationStage;
-
+        VkPipelineStageFlags sourceStage, destinationStage;
         if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
             barrier.srcAccessMask = 0;
             barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -244,7 +237,6 @@ private:
             sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
             destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
         } else {
-            logError("Unsupported layout transition", "From " + std::to_string(oldLayout) + " to " + std::to_string(newLayout));
             throw std::runtime_error("Unsupported layout transition");
         }
 
@@ -260,49 +252,28 @@ private:
         allocInfo.commandBufferCount = 1;
 
         VkCommandBuffer commandBuffer;
-        VkResult result = vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
-        if (result != VK_SUCCESS) {
-            logError("Failed to allocate single-time command buffer", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to allocate command buffer");
-        }
+        vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
 
         VkCommandBufferBeginInfo beginInfo = {};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-        result = vkBeginCommandBuffer(commandBuffer, &beginInfo);
-        if (result != VK_SUCCESS) {
-            logError("Failed to begin single-time command buffer", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to begin command buffer");
-        }
+        vkBeginCommandBuffer(commandBuffer, &beginInfo);
         return commandBuffer;
     }
 
     void endSingleTimeCommands(VkCommandBuffer commandBuffer) {
-        VkResult result = vkEndCommandBuffer(commandBuffer);
-        if (result != VK_SUCCESS) {
-            logError("Failed to end single-time command buffer", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to end command buffer");
-        }
-
+        vkEndCommandBuffer(commandBuffer);
         VkSubmitInfo submitInfo = {};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &commandBuffer;
-
-        result = vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-        if (result != VK_SUCCESS) {
-            logError("Failed to submit single-time command buffer", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to submit command buffer");
-        }
+        vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
         vkQueueWaitIdle(graphicsQueue);
-
         vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
     }
 
     void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height) {
         VkCommandBuffer commandBuffer = beginSingleTimeCommands();
-
         VkBufferImageCopy region = {};
         region.bufferOffset = 0;
         region.bufferRowLength = 0;
@@ -313,7 +284,6 @@ private:
         region.imageSubresource.layerCount = 1;
         region.imageOffset = {0, 0, 0};
         region.imageExtent = {width, height, 1};
-
         vkCmdCopyBufferToImage(commandBuffer, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
         endSingleTimeCommands(commandBuffer);
     }
@@ -331,11 +301,7 @@ private:
         viewInfo.subresourceRange.layerCount = 1;
 
         VkImageView imageView;
-        VkResult result = vkCreateImageView(device, &viewInfo, nullptr, &imageView);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create image view", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to create image view");
-        }
+        vkCreateImageView(device, &viewInfo, nullptr, &imageView);
         return imageView;
     }
 
@@ -359,11 +325,7 @@ private:
         samplerInfo.maxLod = 0.0f;
 
         VkSampler sampler;
-        VkResult result = vkCreateSampler(device, &samplerInfo, nullptr, &sampler);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create sampler", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to create sampler");
-        }
+        vkCreateSampler(device, &samplerInfo, nullptr, &sampler);
         return sampler;
     }
 
@@ -379,30 +341,20 @@ private:
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         layoutInfo.bindingCount = 1;
         layoutInfo.pBindings = &samplerLayoutBinding;
-
-        VkResult result = vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create descriptor set layout", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to create descriptor set layout");
-        }
+        vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout);
     }
 
     void createDescriptorPool() {
         VkDescriptorPoolSize poolSize = {};
         poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSize.descriptorCount = 100; // Максимальное количество текстур
+        poolSize.descriptorCount = 100;
 
         VkDescriptorPoolCreateInfo poolInfo = {};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         poolInfo.poolSizeCount = 1;
         poolInfo.pPoolSizes = &poolSize;
         poolInfo.maxSets = 100;
-
-        VkResult result = vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create descriptor pool", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to create descriptor pool");
-        }
+        vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool);
     }
 
     VulcanImage createVulcanImageFromSurface(SDL_Surface* surface) {
@@ -416,11 +368,7 @@ private:
         createBuffer(width * height * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingMemory);
 
         void* data;
-        VkResult result = vkMapMemory(device, stagingMemory, 0, width * height * 4, 0, &data);
-        if (result != VK_SUCCESS) {
-            logError("Failed to map staging memory", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to map memory");
-        }
+        vkMapMemory(device, stagingMemory, 0, width * height * 4, 0, &data);
         memcpy(data, surface->pixels, width * height * 4);
         vkUnmapMemory(device, stagingMemory);
 
@@ -437,12 +385,7 @@ private:
         allocInfo.descriptorPool = descriptorPool;
         allocInfo.descriptorSetCount = 1;
         allocInfo.pSetLayouts = &descriptorSetLayout;
-
-        result = vkAllocateDescriptorSets(device, &allocInfo, &image.descriptorSet);
-        if (result != VK_SUCCESS) {
-            logError("Failed to allocate descriptor set", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to allocate descriptor set");
-        }
+        vkAllocateDescriptorSets(device, &allocInfo, &image.descriptorSet);
 
         VkDescriptorImageInfo imageInfo = {};
         imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -462,7 +405,55 @@ private:
 
         vkDestroyBuffer(device, stagingBuffer, nullptr);
         vkFreeMemory(device, stagingMemory, nullptr);
+        return image;
+    }
 
+    VulcanImage createVulcanImageFromRGB(uint8_t* rgbData, int width, int height) {
+        VulcanImage image;
+        VkFormat format = VK_FORMAT_R8G8B8A8_SRGB;
+
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingMemory;
+        createBuffer(width * height * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingMemory);
+
+        void* data;
+        vkMapMemory(device, stagingMemory, 0, width * height * 4, 0, &data);
+        memcpy(data, rgbData, width * height * 4);
+        vkUnmapMemory(device, stagingMemory);
+
+        createImage(width, height, format, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, image.image, image.memory);
+        transitionImageLayout(image.image, format, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        copyBufferToImage(stagingBuffer, image.image, width, height);
+        transitionImageLayout(image.image, format, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        image.view = createImageView(image.image, format, VK_IMAGE_ASPECT_COLOR_BIT);
+        image.sampler = createSampler();
+
+        VkDescriptorSetAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.descriptorPool = descriptorPool;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &descriptorSetLayout;
+        vkAllocateDescriptorSets(device, &allocInfo, &image.descriptorSet);
+
+        VkDescriptorImageInfo imageInfo = {};
+        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imageInfo.imageView = image.view;
+        imageInfo.sampler = image.sampler;
+
+        VkWriteDescriptorSet descriptorWrite = {};
+        descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrite.dstSet = image.descriptorSet;
+        descriptorWrite.dstBinding = 1;
+        descriptorWrite.dstArrayElement = 0;
+        descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        descriptorWrite.descriptorCount = 1;
+        descriptorWrite.pImageInfo = &imageInfo;
+
+        vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingMemory, nullptr);
         return image;
     }
 
@@ -507,11 +498,9 @@ private:
 
     void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
         VkCommandBuffer commandBuffer = beginSingleTimeCommands();
-
         VkBufferCopy copyRegion = {};
         copyRegion.size = size;
         vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
-
         endSingleTimeCommands(commandBuffer);
     }
 
@@ -624,11 +613,7 @@ private:
         pipelineLayoutInfo.pushConstantRangeCount = 1;
         pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
 
-        VkResult result = vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create pipeline layout", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to create pipeline layout");
-        }
+        vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout);
 
         VkGraphicsPipelineCreateInfo pipelineInfo = {};
         pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -644,11 +629,7 @@ private:
         pipelineInfo.renderPass = renderPass;
         pipelineInfo.subpass = 0;
 
-        result = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &graphicsPipeline);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create graphics pipeline", "Vulkan error code: " + std::to_string(result));
-            throw std::runtime_error("Failed to create graphics pipeline");
-        }
+        vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &graphicsPipeline);
 
         vkDestroyShaderModule(device, fragShaderModule, nullptr);
         vkDestroyShaderModule(device, vertShaderModule, nullptr);
@@ -674,24 +655,12 @@ private:
         createInfo.enabledExtensionCount = extensionCount;
         createInfo.ppEnabledExtensionNames = extensions.data();
 
-        VkResult result = vkCreateInstance(&createInfo, nullptr, &vkInstance);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create Vulkan instance", "Vulkan error code: " + std::to_string(result));
-            return false;
-        }
+        if (vkCreateInstance(&createInfo, nullptr, &vkInstance) != VK_SUCCESS) return false;
 
-        if (!SDL_Vulkan_CreateSurface(window, vkInstance, &surface)) {
-            logError("Failed to create Vulkan surface", SDL_GetError());
-            return false;
-        }
+        if (!SDL_Vulkan_CreateSurface(window, vkInstance, &surface)) return false;
 
         uint32_t deviceCount = 0;
         vkEnumeratePhysicalDevices(vkInstance, &deviceCount, nullptr);
-        if (deviceCount == 0) {
-            logError("Failed to find GPUs with Vulkan support", "No devices found");
-            return false;
-        }
-
         std::vector<VkPhysicalDevice> devices(deviceCount);
         vkEnumeratePhysicalDevices(vkInstance, &deviceCount, devices.data());
         for (const auto& device : devices) {
@@ -716,10 +685,7 @@ private:
                 break;
             }
         }
-        if (physicalDevice == VK_NULL_HANDLE) {
-            logError("Failed to find suitable GPU", "No suitable device found");
-            return false;
-        }
+        if (physicalDevice == VK_NULL_HANDLE) return false;
 
         float queuePriority = 1.0f;
         VkDeviceQueueCreateInfo queueCreateInfo = {};
@@ -738,11 +704,7 @@ private:
         createInfoDevice.enabledExtensionCount = 1;
         createInfoDevice.ppEnabledExtensionNames = deviceExtensions;
 
-        result = vkCreateDevice(physicalDevice, &createInfoDevice, nullptr, &device);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create logical device", "Vulkan error code: " + std::to_string(result));
-            return false;
-        }
+        if (vkCreateDevice(physicalDevice, &createInfoDevice, nullptr, &device) != VK_SUCCESS) return false;
         vkGetDeviceQueue(device, 0, 0, &graphicsQueue);
         vkGetDeviceQueue(device, 0, 0, &presentQueue);
 
@@ -770,11 +732,7 @@ private:
         createInfoSwapchain.presentMode = presentModes[0];
         createInfoSwapchain.clipped = VK_TRUE;
 
-        result = vkCreateSwapchainKHR(device, &createInfoSwapchain, nullptr, &swapchain);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create swap chain", "Vulkan error code: " + std::to_string(result));
-            return false;
-        }
+        if (vkCreateSwapchainKHR(device, &createInfoSwapchain, nullptr, &swapchain) != VK_SUCCESS) return false;
 
         uint32_t imageCount;
         vkGetSwapchainImagesKHR(device, swapchain, &imageCount, nullptr);
@@ -821,11 +779,7 @@ private:
         renderPassInfo.dependencyCount = 1;
         renderPassInfo.pDependencies = &dependency;
 
-        result = vkCreateRenderPass(device, &renderPassInfo, nullptr, &renderPass);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create render pass", "Vulkan error code: " + std::to_string(result));
-            return false;
-        }
+        if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &renderPass) != VK_SUCCESS) return false;
 
         framebuffers.resize(imageCount);
         for (size_t i = 0; i < imageCount; i++) {
@@ -837,24 +791,14 @@ private:
             framebufferInfo.width = capabilities.currentExtent.width;
             framebufferInfo.height = capabilities.currentExtent.height;
             framebufferInfo.layers = 1;
-
-            result = vkCreateFramebuffer(device, &framebufferInfo, nullptr, &framebuffers[i]);
-            if (result != VK_SUCCESS) {
-                logError("Failed to create framebuffer", "Vulkan error code: " + std::to_string(result));
-                return false;
-            }
+            if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &framebuffers[i]) != VK_SUCCESS) return false;
         }
 
         VkCommandPoolCreateInfo poolInfo = {};
         poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         poolInfo.queueFamilyIndex = 0;
         poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-
-        result = vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool);
-        if (result != VK_SUCCESS) {
-            logError("Failed to create command pool", "Vulkan error code: " + std::to_string(result));
-            return false;
-        }
+        if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS) return false;
 
         commandBuffers.resize(imageCount);
         VkCommandBufferAllocateInfo allocInfo = {};
@@ -862,12 +806,7 @@ private:
         allocInfo.commandPool = commandPool;
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocInfo.commandBufferCount = (uint32_t)commandBuffers.size();
-
-        result = vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data());
-        if (result != VK_SUCCESS) {
-            logError("Failed to allocate command buffers", "Vulkan error code: " + std::to_string(result));
-            return false;
-        }
+        if (vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()) != VK_SUCCESS) return false;
 
         createVertexBuffer();
         createDescriptorSetLayout();
@@ -883,15 +822,12 @@ private:
             VkFenceCreateInfo fenceInfo = {};
             fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
             fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-
             if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphores[i]) != VK_SUCCESS ||
                 vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphores[i]) != VK_SUCCESS ||
                 vkCreateFence(device, &fenceInfo, nullptr, &inFlightFences[i]) != VK_SUCCESS) {
-                logError("Failed to create synchronization objects", "Vulkan error");
                 return false;
             }
         }
-
         return true;
     }
 
@@ -901,27 +837,15 @@ private:
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
 
         window = SDL_CreateWindow("Visual Novel Engine", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1920, 1080, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
-        if (!window) {
-            logError("SDL_CreateWindow Error", SDL_GetError());
-            return false;
-        }
+        if (!window) return false;
 
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-        if (!renderer) {
-            logError("SDL_CreateRenderer Error", SDL_GetError());
-            return false;
-        }
+        if (!renderer) return false;
 
         glContext = SDL_GL_CreateContext(window);
-        if (!glContext) {
-            logError("SDL_GL_CreateContext Error", SDL_GetError());
-            return false;
-        }
+        if (!glContext) return false;
 
-        if (!gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress)) {
-            logError("GLAD initialization failed", "Failed to initialize GLAD");
-            return false;
-        }
+        if (!gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress)) return false;
 
         glViewport(0, 0, 1920, 1080);
         return true;
@@ -930,10 +854,7 @@ private:
     bool initGraphics() {
         if (useVulkan) {
             window = SDL_CreateWindow("Visual Novel Engine", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1920, 1080, SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN);
-            if (!window) {
-                logError("SDL_CreateWindow Error", SDL_GetError());
-                return false;
-            }
+            if (!window) return false;
             return initVulkan();
         } else {
             return initOpenGL();
@@ -941,53 +862,44 @@ private:
     }
 
     bool init() {
-        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
-            logError("SDL_Init Error", SDL_GetError());
-            return false;
-        }
-    
-        if (TTF_Init() == -1) {
-            logError("TTF_Init Error", TTF_GetError());
-            return false;
-        }
-    
-        if (IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG) == 0) {
-            logError("IMG_Init Error", IMG_GetError());
-            return false;
-        }
-    
-        if (Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2, 2048) < 0) {
-            logError("Mix_OpenAudio Error", Mix_GetError());
-            return false;
-        }
-        Mix_Volume(-1, MIX_MAX_VOLUME / 2); // Установить начальную громкость
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) return false;
+        if (TTF_Init() == -1) return false;
+        if (IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG) == 0) return false;
+        if (Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2, 2048) < 0) return false;
+        Mix_Volume(-1, MIX_MAX_VOLUME / 2);
         volume = MIX_MAX_VOLUME / 2;
-        pan = 128; // Центр панорамы
-    
-        if (sqlite3_open("savegame.db", &db) != SQLITE_OK) {
-            logError("SQLite open Error", sqlite3_errmsg(db));
-            return false;
-        }
+        pan = 128;
+
+        if (sqlite3_open("savegame.db", &db) != SQLITE_OK) return false;
         const char* createTableSQL = "CREATE TABLE IF NOT EXISTS savegame (id INTEGER PRIMARY KEY, state TEXT);";
         char* errMsg = nullptr;
         if (sqlite3_exec(db, createTableSQL, nullptr, nullptr, &errMsg) != SQLITE_OK) {
-            logError("SQLite create table Error", errMsg);
             sqlite3_free(errMsg);
             return false;
         }
-    
-        if (!initGraphics()) {
-            logError("Graphics initialization failed", "Failed to initialize Vulkan or OpenGL");
-            return false;
-        }
-    
+
+        if (!initGraphics()) return false;
+
         isRunning = true;
         threads.emplace_back(&VisualNovelEngine::loadResources, this);
-    
-        loadScript("script.txt"); // Загрузка начального сценария
+        loadScript("script.txt");
+        initMenu();
         return true;
     }
-    
+
+    void initMenu() {
+        menuImages.push_back({"menu_background", 0, 0, 1920, 1080});
+        renderText("default", "Start Game", 900, 500, {255, 255, 255, 255});
+        renderText("default", "Exit", 900, 600, {255, 255, 255, 255});
+    }
+
+    void initPauseMenu() {
+        pauseImages.clear();
+        pauseImages.push_back({"pause_background", 0, 0, 1920, 1080});
+        renderText("default", "Resume", 900, 500, {255, 255, 255, 255});
+        renderText("default", "Main Menu", 900, 600, {255, 255, 255, 255});
+    }
+
     void loadResources() {
         while (isRunning) {
             std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -995,7 +907,7 @@ private:
             if (!loadQueue.empty()) {
                 std::string resource = loadQueue.front();
                 loadQueue.pop();
-    
+
                 if (textures.find(resource) == textures.end() && loadedSurfaces.find(resource) == loadedSurfaces.end()) {
                     SDL_Surface* surface = IMG_Load((resource + ".png").c_str());
                     if (surface) {
@@ -1004,54 +916,76 @@ private:
                             vulcanImages[resource] = createVulcanImageFromSurface(surface);
                         } else {
                             SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surface);
-                            if (texture) {
-                                textures[resource] = texture;
-                            } else {
-                                logError("Failed to create texture from surface", SDL_GetError());
-                            }
+                            if (texture) textures[resource] = texture;
                         }
-                    } else {
-                        logError("Image load failed", IMG_GetError());
                     }
                 }
-    
+
                 if (sounds.find(resource) == sounds.end()) {
                     Mix_Chunk* sound = Mix_LoadWAV((resource + ".wav").c_str());
-                    if (sound) {
-                        sounds[resource] = sound;
-                    } else {
-                        logError("Sound load failed", Mix_GetError());
-                    }
+                    if (sound) sounds[resource] = sound;
+                }
+
+                if (music.find(resource) == music.end()) {
+                    Mix_Music* mus = Mix_LoadMUS((resource + ".mp3").c_str());
+                    if (mus) music[resource] = mus;
                 }
             }
         }
     }
-    
+
+    void renderText(const std::string& fontName, const std::string& text, int x, int y, SDL_Color color) {
+        if (fonts.find(fontName) == fonts.end()) {
+            TTF_Font* font = TTF_OpenFont("font.ttf", 24);
+            if (!font) return;
+            fonts[fontName] = font;
+        }
+        TTF_Font* font = fonts[fontName];
+        SDL_Surface* textSurface = TTF_RenderText_Solid(font, text.c_str(), color);
+        if (!textSurface) return;
+
+        std::string textKey = "text_" + std::to_string(x) + "_" + std::to_string(y);
+        if (useVulkan) {
+            vulcanImages[textKey] = createVulcanImageFromSurface(textSurface);
+            if (currentState == GameState::MENU) {
+                menuImages.push_back({textKey, x, y, textSurface->w, textSurface->h});
+            } else if (currentState == GameState::PAUSE) {
+                pauseImages.push_back({textKey, x, y, textSurface->w, textSurface->h});
+            } else {
+                imagesToDisplay.push_back({textKey, x, y, textSurface->w, textSurface->h});
+            }
+        } else {
+            SDL_Texture* textTexture = SDL_CreateTextureFromSurface(renderer, textSurface);
+            if (textTexture) {
+                textures[textKey] = textTexture;
+                if (currentState == GameState::MENU) {
+                    menuImages.push_back({textKey, x, y, textSurface->w, textSurface->h});
+                } else if (currentState == GameState::PAUSE) {
+                    pauseImages.push_back({textKey, x, y, textSurface->w, textSurface->h});
+                } else {
+                    imagesToDisplay.push_back({textKey, x, y, textSurface->w, textSurface->h});
+                }
+            }
+        }
+        SDL_FreeSurface(textSurface);
+    }
+
     void render() {
         std::lock_guard<std::mutex> lock(renderMutex);
         if (useVulkan) {
             vkWaitForFences(device, 1, &inFlightFences[currentFrameIndex], VK_TRUE, UINT64_MAX);
-    
             uint32_t imageIndex;
             VkResult result = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailableSemaphores[currentFrameIndex], VK_NULL_HANDLE, &imageIndex);
-            if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
-                logError("Failed to acquire swapchain image", "Vulkan error code: " + std::to_string(result));
-                return;
-            }
-    
+            if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) return;
+
             vkResetFences(device, 1, &inFlightFences[currentFrameIndex]);
             vkResetCommandBuffer(commandBuffers[imageIndex], 0);
-    
+
             VkCommandBufferBeginInfo beginInfo = {};
             beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    
-            result = vkBeginCommandBuffer(commandBuffers[imageIndex], &beginInfo);
-            if (result != VK_SUCCESS) {
-                logError("Failed to begin command buffer", "Vulkan error code: " + std::to_string(result));
-                return;
-            }
-    
+            vkBeginCommandBuffer(commandBuffers[imageIndex], &beginInfo);
+
             VkRenderPassBeginInfo renderPassInfo = {};
             renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
             renderPassInfo.renderPass = renderPass;
@@ -1061,16 +995,23 @@ private:
             VkClearValue clearColor = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
             renderPassInfo.clearValueCount = 1;
             renderPassInfo.pClearValues = &clearColor;
-    
+
             vkCmdBeginRenderPass(commandBuffers[imageIndex], &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
             vkCmdBindPipeline(commandBuffers[imageIndex], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
-    
+
             VkBuffer vertexBuffers[] = {vertexBuffer};
             VkDeviceSize offsets[] = {0};
             vkCmdBindVertexBuffers(commandBuffers[imageIndex], 0, 1, vertexBuffers, offsets);
             vkCmdBindIndexBuffer(commandBuffers[imageIndex], indexBuffer, 0, VK_INDEX_TYPE_UINT16);
-    
-            for (const auto& img : imagesToDisplay) {
+
+            std::vector<DisplayImage>* activeImages = nullptr;
+            switch (currentState) {
+                case GameState::MENU: activeImages = &menuImages; break;
+                case GameState::GAME: activeImages = &imagesToDisplay; break;
+                case GameState::PAUSE: activeImages = &pauseImages; break;
+            }
+
+            for (const auto& img : *activeImages) {
                 if (vulcanImages.find(img.name) != vulcanImages.end()) {
                     Transform transform = {(float)img.x, (float)img.y, (float)img.w, (float)img.h};
                     vkCmdPushConstants(commandBuffers[imageIndex], pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Transform), &transform);
@@ -1078,14 +1019,10 @@ private:
                     vkCmdDrawIndexed(commandBuffers[imageIndex], 6, 1, 0, 0, 0);
                 }
             }
-    
+
             vkCmdEndRenderPass(commandBuffers[imageIndex]);
-            result = vkEndCommandBuffer(commandBuffers[imageIndex]);
-            if (result != VK_SUCCESS) {
-                logError("Failed to end command buffer", "Vulkan error code: " + std::to_string(result));
-                return;
-            }
-    
+            vkEndCommandBuffer(commandBuffers[imageIndex]);
+
             VkSubmitInfo submitInfo = {};
             submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             VkSemaphore waitSemaphores[] = {imageAvailableSemaphores[currentFrameIndex]};
@@ -1098,13 +1035,9 @@ private:
             VkSemaphore signalSemaphores[] = {renderFinishedSemaphores[currentFrameIndex]};
             submitInfo.signalSemaphoreCount = 1;
             submitInfo.pSignalSemaphores = signalSemaphores;
-    
-            result = vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFences[currentFrameIndex]);
-            if (result != VK_SUCCESS) {
-                logError("Failed to submit draw command buffer", "Vulkan error code: " + std::to_string(result));
-                return;
-            }
-    
+
+            vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFences[currentFrameIndex]);
+
             VkPresentInfoKHR presentInfo = {};
             presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
             presentInfo.waitSemaphoreCount = 1;
@@ -1112,17 +1045,19 @@ private:
             presentInfo.swapchainCount = 1;
             presentInfo.pSwapchains = &swapchain;
             presentInfo.pImageIndices = &imageIndex;
-    
-            result = vkQueuePresentKHR(presentQueue, &presentInfo);
-            if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
-                logError("Failed to present swapchain image", "Vulkan error code: " + std::to_string(result));
-                return;
-            }
-    
+
+            vkQueuePresentKHR(presentQueue, &presentInfo);
             currentFrameIndex = (currentFrameIndex + 1) % 2;
         } else {
             SDL_RenderClear(renderer);
-            for (const auto& img : imagesToDisplay) {
+            std::vector<DisplayImage>* activeImages = nullptr;
+            switch (currentState) {
+                case GameState::MENU: activeImages = &menuImages; break;
+                case GameState::GAME: activeImages = &imagesToDisplay; break;
+                case GameState::PAUSE: activeImages = &pauseImages; break;
+            }
+
+            for (const auto& img : *activeImages) {
                 if (textures.find(img.name) != textures.end()) {
                     SDL_Rect rect = {img.x, img.y, img.w, img.h};
                     SDL_RenderCopy(renderer, textures[img.name], nullptr, &rect);
@@ -1131,164 +1066,109 @@ private:
             SDL_RenderPresent(renderer);
         }
     }
-    
-    void showImage(const std::string& imageName, int x, int y, int w, int h) {
-        std::lock_guard<std::mutex> lock(renderMutex);
-        if (useVulkan && vulcanImages.find(imageName) == vulcanImages.end() ||
-            !useVulkan && textures.find(imageName) == textures.end()) {
-            loadQueue.push(imageName);
-        }
-        imagesToDisplay.push_back({imageName, x, y, w, h});
-    }
-    
-    void renderText(const std::string& fontName, const std::string& text, int x, int y, SDL_Color color) {
-        std::lock_guard<std::mutex> lock(renderMutex);
-        if (fonts.find(fontName) == fonts.end()) {
-            TTF_Font* font = TTF_OpenFont("font.ttf", 24);
-            if (!font) {
-                logError("Failed to load font", TTF_GetError());
-                return;
-            }
-            fonts[fontName] = font;
-        }
-        TTF_Font* font = fonts[fontName];
-        SDL_Surface* textSurface = TTF_RenderText_Solid(font, text.c_str(), color);
-        if (!textSurface) {
-            logError("Failed to render text", TTF_GetError());
-            return;
-        }
-    
-        std::string textKey = "text_" + std::to_string(x) + "_" + std::to_string(y);
-        if (useVulkan) {
-            vulcanImages[textKey] = createVulcanImageFromSurface(textSurface);
-            imagesToDisplay.push_back({textKey, x, y, textSurface->w, textSurface->h});
-        } else {
-            SDL_Texture* textTexture = SDL_CreateTextureFromSurface(renderer, textSurface);
-            if (!textTexture) {
-                logError("Failed to create text texture", SDL_GetError());
-                SDL_FreeSurface(textSurface);
-                return;
-            }
-            textures[textKey] = textTexture;
-            imagesToDisplay.push_back({textKey, x, y, textSurface->w, textSurface->h});
-        }
-        SDL_FreeSurface(textSurface);
-    }
-    
-    void playSound(const std::string& soundName) {
-        std::lock_guard<std::mutex> lock(renderMutex);
-        if (sounds.find(soundName) != sounds.end()) {
-            int channel = Mix_PlayChannel(-1, sounds[soundName], 0);
-            if (channel != -1) {
-                Mix_Volume(channel, volume);
-                Mix_SetPanning(channel, pan, 255 - pan);
-            } else {
-                logError("Failed to play sound", Mix_GetError());
-            }
-        } else {
-            loadQueue.push(soundName);
-        }
-    }
-    
+
     void handleEvents() {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
                 isRunning = false;
-            } else if (event.type == SDL_KEYDOWN || event.type == SDL_MOUSEBUTTONDOWN) {
-                if (!isWaitingForInput) {
-                    advanceStory = true;
-                } else {
-                    isWaitingForInput = false;
-                    advanceStory = true;
-                }
+            }
+
+            switch (currentState) {
+                case GameState::MENU:
+                    if (event.type == SDL_MOUSEBUTTONDOWN) {
+                        int x = event.button.x, y = event.button.y;
+                        if (x >= 900 && x <= 1100 && y >= 500 && y <= 550) {
+                            currentState = GameState::GAME;
+                        } else if (x >= 900 && x <= 1000 && y >= 600 && y <= 650) {
+                            isRunning = false;
+                        }
+                    }
+                    break;
+
+                case GameState::GAME:
+                    if (event.type == SDL_KEYDOWN) {
+                        if (event.key.keysym.sym == SDLK_ESCAPE) {
+                            currentState = GameState::PAUSE;
+                            if (isVideoPlaying) {
+                                isVideoPlaying = false;
+                            }
+                            initPauseMenu();
+                        } else if (!isWaitingForInput) {
+                            advanceStory = true;
+                        } else {
+                            isWaitingForInput = false;
+                            advanceStory = true;
+                        }
+                    }
+                    break;
+
+                case GameState::PAUSE:
+                    if (event.type == SDL_KEYDOWN) {
+                        if (event.key.keysym.sym == SDLK_ESCAPE) {
+                            currentState = GameState::GAME;
+                        } else if (event.key.keysym.sym == SDLK_m) { // Пример смены музыки
+                            MPlayBackgroundMusic("pause_music", -1);
+                        }
+                    } else if (event.type == SDL_MOUSEBUTTONDOWN) {
+                        int x = event.button.x, y = event.button.y;
+                        if (x >= 900 && x <= 1100 && y >= 600 && y <= 650) {
+                            currentState = GameState::MENU;
+                        }
+                    }
+                    break;
             }
         }
     }
-    
+
     void executeCommand(const std::string& command) {
         std::istringstream iss(command);
         std::string cmdType;
         iss >> cmdType;
-    
+
         if (cmdType == "show") {
             std::string resourceType, resourceName;
-            iss >> resourceType >> resourceName;
+            int x, y, w, h;
+            iss >> resourceType >> resourceName >> x >> y >> w >> h;
             if (resourceType == "image") {
-                showImage(resourceName, 0, 0, 1920, 1080);
+                GShowImage(resourceName, x, y, w, h);
             }
         } else if (cmdType == "say") {
             std::string text;
             std::getline(iss, text);
             text = text.substr(text.find_first_not_of(" "));
-            renderText("default", text, 100, 900, {255, 255, 255, 255});
+            GTextToScreen(text, "default", 100, 900, {255, 255, 255, 255}, "dialog_bg");
             isWaitingForInput = true;
         } else if (cmdType == "play") {
-            std::string resourceType, soundName;
-            iss >> resourceType >> soundName;
+            std::string resourceType, resourceName;
+            iss >> resourceType >> resourceName;
             if (resourceType == "sound") {
-                playSound(soundName);
-            }
-        } else if (cmdType == "choice") {
-            std::vector<std::pair<std::string, std::string>> choices;
-            std::string choiceStr;
-            std::getline(iss, choiceStr);
-            std::istringstream choiceIss(choiceStr);
-            std::string option, label;
-            while (std::getline(choiceIss, option, ',') && std::getline(choiceIss, label, ',')) {
-                option = option.substr(option.find_first_not_of(" "));
-                label = label.substr(label.find_first_not_of(" "));
-                choices.push_back({option, label});
-                renderText("default", option, 100, 900 + (choices.size() - 1) * 50, {255, 255, 255, 255});
-            }
-            // Здесь нужно добавить логику выбора пользователем (например, через handleEvents)
-            isWaitingForInput = true;
-        } else if (cmdType == "loop") {
-            int count;
-            iss >> count;
-            std::string loopCommand;
-            std::getline(iss, loopCommand);
-            for (int i = 0; i < count; ++i) {
-                executeCommand(loopCommand);
-            }
-        } else if (cmdType == "if") {
-            std::string condition, thenCommand;
-            iss >> condition;
-            std::getline(iss, thenCommand);
-            // Простая проверка условия (например, "var > 5")
-            std::string varName = condition.substr(0, condition.find(' '));
-            char op = condition[condition.find(' ') + 1];
-            int value = std::stoi(condition.substr(condition.find(' ') + 3));
-            if (variables.find(varName) != variables.end()) {
-                int varValue = variables[varName];
-                if ((op == '>' && varValue > value) || (op == '<' && varValue < value) || (op == '=' && varValue == value)) {
-                    executeCommand(thenCommand);
+                MPlaySound(resourceName);
+            } else if (resourceType == "music") {
+                MPlayBackgroundMusic(resourceName);
+            } else if (resourceType == "video") {
+                int x = 0, y = 0, w = 1920, h = 1080;
+                if (iss >> x >> y >> w >> h) {
+                    GPlayVideo(resourceName, x, y, w, h);
+                } else {
+                    GPlayVideo(resourceName);
                 }
+                isWaitingForInput = true;
             }
-        } else if (cmdType == "set") {
-            std::string varName;
-            int value;
-            iss >> varName >> value;
-            variables[varName] = value;
-        } else if (cmdType == "label") {
-            std::string labelName;
-            iss >> labelName;
-            scriptLabels[labelName] = currentCommand;
-        } else if (cmdType == "goto") {
-            std::string labelName;
-            iss >> labelName;
-            if (scriptLabels.find(labelName) != scriptLabels.end()) {
-                currentCommand = scriptLabels[labelName];
-            }
+        } else if (cmdType == "stop_music") {
+            MStopBackgroundMusic();
+        } else if (cmdType == "volume") {
+            int vol;
+            iss >> vol;
+            MSetVolume(vol);
+        } else if (cmdType == "clear") {
+            GClearScreen();
         }
     }
-    
+
     void loadScript(const std::string& filename) {
         std::ifstream file(filename);
-        if (!file.is_open()) {
-            logError("Failed to open script file", filename);
-            return;
-        }
+        if (!file.is_open()) return;
         script.clear();
         scriptLabels.clear();
         std::string line;
@@ -1307,84 +1187,35 @@ private:
         }
         file.close();
     }
-    
-    void saveGame() {
-        std::lock_guard<std::mutex> lock(renderMutex);
-        json state;
-        state["currentCommand"] = currentCommand;
-        state["images"] = json::array();
-        for (const auto& img : imagesToDisplay) {
-            state["images"].push_back({{"name", img.name}, {"x", img.x}, {"y", img.y}, {"w", img.w}, {"h", img.h}});
-        }
-        state["variables"] = variables;
-    
-        std::string stateStr = state.dump();
-        sqlite3_stmt* stmt;
-        std::string sql = "INSERT OR REPLACE INTO savegame (id, state) VALUES (1, ?);";
-        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, stateStr.c_str(), -1, SQLITE_STATIC);
-            if (sqlite3_step(stmt) != SQLITE_DONE) {
-                logError("SQLite save Error", sqlite3_errmsg(db));
-            }
-            sqlite3_finalize(stmt);
-        } else {
-            logError("SQLite prepare Error", sqlite3_errmsg(db));
-        }
-    }
-    
-    void loadGame() {
-        std::lock_guard<std::mutex> lock(renderMutex);
-        sqlite3_stmt* stmt;
-        std::string sql = "SELECT state FROM savegame WHERE id = 1;";
-        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) == SQLITE_OK) {
-            if (sqlite3_step(stmt) == SQLITE_ROW) {
-                const char* stateStr = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-                json state = json::parse(stateStr);
-                currentCommand = state["currentCommand"];
-                imagesToDisplay.clear();
-                for (const auto& img : state["images"]) {
-                    imagesToDisplay.push_back({img["name"], img["x"], img["y"], img["w"], img["h"]});
-                }
-                variables = state["variables"].get<std::map<std::string, int>>();
-            }
-            sqlite3_finalize(stmt);
-        } else {
-            logError("SQLite load Error", sqlite3_errmsg(db));
-        }
-    }
-    
+
     void run() {
         while (isRunning) {
             handleEvents();
-            if (advanceStory && currentCommand < script.size()) {
+
+            if (currentState == GameState::GAME && advanceStory && currentCommand < script.size()) {
                 executeCommand(script[currentCommand]);
                 if (!isWaitingForInput) {
                     currentCommand++;
                     advanceStory = false;
                 }
             }
+
             render();
         }
     }
-    
+
     void cleanup() {
         isRunning = false;
         for (auto& thread : threads) {
             if (thread.joinable()) thread.join();
         }
-    
-        for (auto& texture : textures) {
-            SDL_DestroyTexture(texture.second);
-        }
-        for (auto& sound : sounds) {
-            Mix_FreeChunk(sound.second);
-        }
-        for (auto& font : fonts) {
-            TTF_CloseFont(font.second);
-        }
-        for (auto& surface : loadedSurfaces) {
-            SDL_FreeSurface(surface.second);
-        }
+
+        for (auto& texture : textures) SDL_DestroyTexture(texture.second);
+        for (auto& sound : sounds) Mix_FreeChunk(sound.second);
+        for (auto& mus : music) Mix_FreeMusic(mus.second);
+        for (auto& font : fonts) TTF_CloseFont(font.second);
+        for (auto& surface : loadedSurfaces) SDL_FreeSurface(surface.second);
+
         if (useVulkan) {
             for (size_t i = 0; i < 2; i++) {
                 vkDestroySemaphore(device, imageAvailableSemaphores[i], nullptr);
@@ -1392,15 +1223,11 @@ private:
                 vkDestroyFence(device, inFlightFences[i], nullptr);
             }
             vkDestroyCommandPool(device, commandPool, nullptr);
-            for (auto& fb : framebuffers) {
-                vkDestroyFramebuffer(device, fb, nullptr);
-            }
+            for (auto& fb : framebuffers) vkDestroyFramebuffer(device, fb, nullptr);
             vkDestroyPipeline(device, graphicsPipeline, nullptr);
             vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
             vkDestroyRenderPass(device, renderPass, nullptr);
-            for (auto& imageView : swapchainImageViews) {
-                vkDestroyImageView(device, imageView, nullptr);
-            }
+            for (auto& imageView : swapchainImageViews) vkDestroyImageView(device, imageView, nullptr);
             vkDestroySwapchainKHR(device, swapchain, nullptr);
             vkDestroyDescriptorPool(device, descriptorPool, nullptr);
             vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
@@ -1428,25 +1255,301 @@ private:
         IMG_Quit();
         SDL_Quit();
     }
-    
-    public:
-        VisualNovelEngine(bool useVulkan_ = true) : isRunning(false), useVulkan(useVulkan_) {}
-        ~VisualNovelEngine() { cleanup(); }
-    
-        bool start() {
-            if (!init()) return false;
-            run();
-            return true;
-        }
-    };
-    
-    int main() {
-        VisualNovelEngine engine(true); // Использовать Vulkan
-        if (!engine.start()) {
-            std::cerr << "Engine failed to start" << std::endl;
-            return 1;
-        }
-        return 0;
+
+public:
+    VisualNovelEngine(bool useVulkan_ = true) : isRunning(false), useVulkan(useVulkan_) {}
+    ~VisualNovelEngine() { cleanup(); }
+
+    bool start() {
+        if (!init()) return false;
+        run();
+        return true;
     }
 
-       
+    void GShowImage(const std::string& imageName, int x, int y, int w, int h) {
+        std::lock_guard<std::mutex> lock(renderMutex);
+        if (useVulkan && vulcanImages.find(imageName) == vulcanImages.end() ||
+            !useVulkan && textures.find(imageName) == textures.end()) {
+            loadQueue.push(imageName);
+        }
+        imagesToDisplay.push_back({imageName, x, y, w, h});
+    }
+
+    void GTextToScreen(const std::string& text, const std::string& fontName, int x, int y, SDL_Color color, const std::string& backgroundImage = "") {
+        std::lock_guard<std::mutex> lock(renderMutex);
+        if (!backgroundImage.empty()) {
+            GShowImage(backgroundImage, x - 10, y - 10, 1920, 200);
+        }
+        renderText(fontName, text, x, y, color);
+    }
+
+    void GClearScreen() {
+        std::lock_guard<std::mutex> lock(renderMutex);
+        imagesToDisplay.clear();
+    }
+
+    void GPlayVideo(const std::string& videoName, int x = 0, int y = 0, int w = 1920, int h = 1080) {
+        std::lock_guard<std::mutex> lock(renderMutex);
+        isVideoPlaying = true;
+
+        AVFormatContext* formatContext = nullptr;
+        if (avformat_open_input(&formatContext, (videoName + ".mp4").c_str(), nullptr, nullptr) != 0) {
+            logError("Failed to open video file", videoName);
+            return;
+        }
+
+        if (avformat_find_stream_info(formatContext, nullptr) < 0) {
+            logError("Failed to find stream info", videoName);
+            avformat_close_input(&formatContext);
+            return;
+        }
+
+        int videoStreamIndex = -1, audioStreamIndex = -1;
+        AVCodecParameters *videoCodecParams = nullptr, *audioCodecParams = nullptr;
+        const AVCodec *videoCodec = nullptr, *audioCodec = nullptr;
+
+        for (unsigned int i = 0; i < formatContext->nb_streams; i++) {
+            if (formatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && videoStreamIndex == -1) {
+                videoStreamIndex = i;
+                videoCodecParams = formatContext->streams[i]->codecpar;
+                videoCodec = avcodec_find_decoder(videoCodecParams->codec_id);
+            } else if (formatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && audioStreamIndex == -1) {
+                audioStreamIndex = i;
+                audioCodecParams = formatContext->streams[i]->codecpar;
+                audioCodec = avcodec_find_decoder(audioCodecParams->codec_id);
+            }
+        }
+
+        if (videoStreamIndex == -1) {
+            logError("No video stream found", videoName);
+            avformat_close_input(&formatContext);
+            return;
+        }
+
+        AVCodecContext* videoCodecContext = avcodec_alloc_context3(videoCodec);
+        avcodec_parameters_to_context(videoCodecContext, videoCodecParams);
+        if (avcodec_open2(videoCodecContext, videoCodec, nullptr) < 0) {
+            logError("Failed to open video codec", videoName);
+            avcodec_free_context(&videoCodecContext);
+            avformat_close_input(&formatContext);
+            return;
+        }
+
+        AVCodecContext* audioCodecContext = nullptr;
+        SwrContext* swrContext = nullptr;
+        if (audioStreamIndex != -1) {
+            audioCodecContext = avcodec_alloc_context3(audioCodec);
+            avcodec_parameters_to_context(audioCodecContext, audioCodecParams);
+            if (avcodec_open2(audioCodecContext, audioCodec, nullptr) < 0) {
+                logError("Failed to open audio codec", videoName);
+                avcodec_free_context(&audioCodecContext);
+                audioStreamIndex = -1;
+            } else {
+                swrContext = swr_alloc_set_opts(nullptr, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16, 44100,
+                                                audioCodecContext->channel_layout, audioCodecContext->sample_fmt, audioCodecContext->sample_rate,
+                                                0, nullptr);
+                swr_init(swrContext);
+            }
+        }
+
+        SwsContext* swsContext = sws_getContext(videoCodecContext->width, videoCodecContext->height, videoCodecContext->pix_fmt,
+                                                w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+
+        AVFrame* videoFrame = av_frame_alloc();
+        AVFrame* rgbFrame = av_frame_alloc();
+        uint8_t* videoBuffer = (uint8_t*)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGBA, w, h, 1));
+        av_image_fill_arrays(rgbFrame->data, rgbFrame->linesize, videoBuffer, AV_PIX_FMT_RGBA, w, h, 1);
+
+        AVFrame* audioFrame = av_frame_alloc();
+        std::vector<uint8_t> audioBuffer;
+        int audioChannel = -1;
+
+        AVPacket packet;
+        SDL_Texture* videoTexture = nullptr;
+        VulcanImage videoVulkanImage;
+        std::string videoKey = "video_" + videoName;
+        double videoTimeBase = av_q2d(formatContext->streams[videoStreamIndex]->time_base);
+        double audioTimeBase = audioStreamIndex != -1 ? av_q2d(formatContext->streams[audioStreamIndex]->time_base) : 0;
+        int64_t lastVideoPts = AV_NOPTS_VALUE;
+
+        if (!useVulkan) {
+            videoTexture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+        }
+
+        while (isVideoPlaying && av_read_frame(formatContext, &packet) >= 0) {
+            if (currentState != GameState::GAME) {
+                isVideoPlaying = false;
+                break;
+            }
+
+            if (packet.stream_index == videoStreamIndex) {
+                if (avcodec_send_packet(videoCodecContext, &packet) == 0) {
+                    while (avcodec_receive_frame(videoCodecContext, videoFrame) == 0) {
+                        sws_scale(swsContext, videoFrame->data, videoFrame->linesize, 0, videoCodecContext->height, rgbFrame->data, rgbFrame->linesize);
+
+                        if (useVulkan) {
+                            if (vulcanImages.find(videoKey) != vulcanImages.end()) {
+                                vkDestroySampler(device, vulcanImages[videoKey].sampler, nullptr);
+                                vkDestroyImageView(device, vulcanImages[videoKey].view, nullptr);
+                                vkDestroyImage(device, vulcanImages[videoKey].image, nullptr);
+                                vkFreeMemory(device, vulcanImages[videoKey].memory, nullptr);
+                            }
+                            vulcanImages[videoKey] = createVulcanImageFromRGB(rgbFrame->data[0], w, h);
+                            imagesToDisplay.clear();
+                            imagesToDisplay.push_back({videoKey, x, y, w, h});
+                        } else {
+                            SDL_UpdateTexture(videoTexture, nullptr, rgbFrame->data[0], rgbFrame->linesize[0]);
+                            SDL_Rect rect = {x, y, w, h};
+                            SDL_RenderClear(renderer);
+                            SDL_RenderCopy(renderer, videoTexture, nullptr, &rect);
+                            SDL_RenderPresent(renderer);
+                        }
+
+                        if (lastVideoPts != AV_NOPTS_VALUE) {
+                            int64_t frameDelay = videoFrame->pts - lastVideoPts;
+                            SDL_Delay(static_cast<Uint32>(frameDelay * videoTimeBase * 1000));
+                        }
+                        lastVideoPts = videoFrame->pts;
+                    }
+                }
+            } else if (packet.stream_index == audioStreamIndex && audioCodecContext) {
+                if (avcodec_send_packet(audioCodecContext, &packet) == 0) {
+                    while (avcodec_receive_frame(audioCodecContext, audioFrame) == 0) {
+                        int outSamples = swr_convert(swrContext, nullptr, 0, (const uint8_t**)audioFrame->data, audioFrame->nb_samples);
+                        int bufferSize = av_samples_get_buffer_size(nullptr, 2, outSamples, AV_SAMPLE_FMT_S16, 1);
+                        audioBuffer.resize(bufferSize);
+                        swr_convert(swrContext, &audioBuffer.data(), outSamples, (const uint8_t**)audioFrame->data, audioFrame->nb_samples);
+
+                        Mix_Chunk* audioChunk = Mix_QuickLoad_RAW(audioBuffer.data(), audioBuffer.size());
+                        if (audioChunk) {
+                            audioChannel = Mix_PlayChannel(-1, audioChunk, 0);
+                            if (audioChannel != -1) {
+                                Mix_Volume(audioChannel, volume);
+                            } else {
+                                Mix_FreeChunk(audioChunk);
+                            }
+                        }
+                    }
+                }
+            }
+
+            av_packet_unref(&packet);
+
+            SDL_Event event;
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_QUIT || (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)) {
+                    isVideoPlaying = false;
+                }
+            }
+
+            if (useVulkan) render();
+        }
+
+        if (!useVulkan && videoTexture) SDL_DestroyTexture(videoTexture);
+        if (useVulkan && vulcanImages.find(videoKey) != vulcanImages.end()) {
+            vkDestroySampler(device, vulcanImages[videoKey].sampler, nullptr);
+            vkDestroyImageView(device, vulcanImages[videoKey].view, nullptr);
+            vkDestroyImage(device, vulcanImages[videoKey].image, nullptr);
+            vkFreeMemory(device, vulcanImages[videoKey].memory, nullptr);
+            vulcanImages.erase(videoKey);
+        }
+        av_free(videoBuffer);
+        av_frame_free(&rgbFrame);
+        av_frame_free(&videoFrame);
+        av_frame_free(&audioFrame);
+        sws_freeContext(swsContext);
+        if (swrContext) swr_free(&swrContext);
+        if (audioCodecContext) avcodec_free_context(&audioCodecContext);
+        avcodec_free_context(&videoCodecContext);
+        avformat_close_input(&formatContext);
+
+        isVideoPlaying = false;
+    }
+
+    void GSetImageEffect(const std::string& imageName, const std::string& effect) {
+        std::lock_guard<std::mutex> lock(renderMutex);
+        // Заглушка для эффектов (например, fade)
+        if (effect == "fade") {
+            logError("Fade effect not implemented yet", imageName);
+        }
+    }
+
+    void MPlaySound(const std::string& soundName) {
+        std::lock_guard<std::mutex> lock(renderMutex);
+        if (sounds.find(soundName) != sounds.end()) {
+            int channel = Mix_PlayChannel(-1, sounds[soundName], 0);
+            if (channel != -1) {
+                Mix_Volume(channel, volume);
+                Mix_SetPanning(channel, pan, 255 - pan);
+            }
+        } else {
+            loadQueue.push(soundName);
+        }
+    }
+
+    void MPlayBackgroundMusic(const std::string& musicName, int loops = -1) {
+        std::lock_guard<std::mutex> lock(renderMutex);
+        if (music.find(musicName) != music.end()) {
+            Mix_PlayMusic(music[musicName], loops);
+        } else {
+            loadQueue.push(musicName);
+        }
+    }
+
+    void MStopBackgroundMusic() {
+        Mix_HaltMusic();
+    }
+
+    void MSetVolume(int newVolume) {
+        volume = std::clamp(newVolume, 0, MIX_MAX_VOLUME);
+        Mix_Volume(-1, volume);
+    }
+
+    void SSaveGame(int slot = 1) {
+        std::lock_guard<std::mutex> lock(renderMutex);
+        json saveData;
+        saveData["command"] = currentCommand;
+        saveData["images"] = json::array();
+        for (const auto& img : imagesToDisplay) {
+            saveData["images"].push_back({{"name", img.name}, {"x", img.x}, {"y", img.y}, {"w", img.w}, {"h", img.h}});
+        }
+        saveData["variables"] = variables;
+
+        std::string saveString = saveData.dump();
+        std::string sql = "INSERT OR REPLACE INTO savegame (id, state) VALUES (" + std::to_string(slot) + ", ?)";
+        sqlite3_stmt* stmt;
+        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, saveString.c_str(), -1, SQLITE_STATIC);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    void SLoadGame(int slot = 1) {
+        std::lock_guard<std::mutex> lock(renderMutex);
+        std::string sql = "SELECT state FROM savegame WHERE id = " + std::to_string(slot);
+        sqlite3_stmt* stmt;
+        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                std::string saveString = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                json saveData = json::parse(saveString);
+                currentCommand = saveData["command"];
+                imagesToDisplay.clear();
+                for (const auto& img : saveData["images"]) {
+                    imagesToDisplay.push_back({img["name"], img["x"], img["y"], img["w"], img["h"]});
+                }
+                variables = saveData["variables"].get<std::map<std::string, int>>();
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+};
+
+int main() {
+    VisualNovelEngine engine(true); // Использовать Vulkan
+    if (!engine.start()) {
+        std::cerr << "Engine failed to start" << std::endl;
+        return 1;
+    }
+    return 0;
+}

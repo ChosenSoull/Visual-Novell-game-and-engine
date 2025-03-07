@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "avcodec.h": "c",
+        "imgutils.h": "c"
+    }
+}
