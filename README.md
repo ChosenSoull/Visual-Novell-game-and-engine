@@ -32,11 +32,7 @@
     Скомпилируйте движок:
     bash
 
-g++ -std=c++17 engine.c -o VisualNovelEngine \
-    -I/usr/include/SDL2 -lSDL2 -lSDL2_ttf -lSDL2_image -lSDL2_mixer \
-    -lavcodec -lavformat -lavutil -lswscale -lswresample \
-    -lsqlite3 -lvulkan \
-    -pthread
+g++ -std=c++17 engine.c files/src/glad.c -o VisualNovelEngine     -I/usr/include/SDL2 -lSDL2 -lSDL2_ttf -lSDL2_image -lSDL2_mixer     -lavcodec -lavformat -lavutil -lswscale -lswresample     -lsqlite3 -lvulkan     -pthread
 Для OpenGL замените -lvulkan на -lGL -lGLU -lGLEW.
 (Опционально) Укажите рендеринг через переменную окружения:
 bash

@@ -7,8 +7,7 @@
 #include <SDL_image.h>
 #include <SDL_mixer.h>
 #include <sqlite3.h>
-#include <GLAD/glad.h>
-#include <SDL_opengl.h>
+#include <SDL_vulkan.h>
 #include <vulkan/vulkan.h>
 #include <thread>
 #include <vector>
@@ -20,6 +19,8 @@
 #include <chrono>
 #include <queue>
 #include <filesystem>
+#include <algorithm>
+#include "files/include/glad/glad.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -1271,182 +1272,198 @@ public:
     }
 
     void GPlayVideo(const std::string& videoName, int x = 0, int y = 0, int w = 1920, int h = 1080) {
-        std::lock_guard<std::mutex> lock(renderMutex);
-        isVideoPlaying = true;
-
-        AVFormatContext* formatContext = nullptr;
-        if (avformat_open_input(&formatContext, (videoName + ".mp4").c_str(), nullptr, nullptr) != 0) {
-            logError("Failed to open video file", videoName);
-            return;
-        }
-
-        if (avformat_find_stream_info(formatContext, nullptr) < 0) {
-            logError("Failed to find stream info", videoName);
-            avformat_close_input(&formatContext);
-            return;
-        }
-
-        int videoStreamIndex = -1, audioStreamIndex = -1;
-        AVCodecParameters *videoCodecParams = nullptr, *audioCodecParams = nullptr;
-        const AVCodec *videoCodec = nullptr, *audioCodec = nullptr;
-
-        for (unsigned int i = 0; i < formatContext->nb_streams; i++) {
-            if (formatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && videoStreamIndex == -1) {
-                videoStreamIndex = i;
-                videoCodecParams = formatContext->streams[i]->codecpar;
-                videoCodec = avcodec_find_decoder(videoCodecParams->codec_id);
-            } else if (formatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && audioStreamIndex == -1) {
-                audioStreamIndex = i;
-                audioCodecParams = formatContext->streams[i]->codecpar;
-                audioCodec = avcodec_find_decoder(audioCodecParams->codec_id);
+            std::lock_guard<std::mutex> lock(renderMutex);
+            isVideoPlaying = true;
+        
+            AVFormatContext* formatContext = nullptr;
+            if (avformat_open_input(&formatContext, (videoName + ".mp4").c_str(), nullptr, nullptr) != 0) {
+                logError("Failed to open video file", videoName);
+                return;
             }
-        }
-
-        if (videoStreamIndex == -1) {
-            logError("No video stream found", videoName);
-            avformat_close_input(&formatContext);
-            return;
-        }
-
-        AVCodecContext* videoCodecContext = avcodec_alloc_context3(videoCodec);
-        avcodec_parameters_to_context(videoCodecContext, videoCodecParams);
-        if (avcodec_open2(videoCodecContext, videoCodec, nullptr) < 0) {
-            logError("Failed to open video codec", videoName);
+        
+            if (avformat_find_stream_info(formatContext, nullptr) < 0) {
+                logError("Failed to find stream info", videoName);
+                avformat_close_input(&formatContext);
+                return;
+            }
+        
+            int videoStreamIndex = -1, audioStreamIndex = -1;
+            AVCodecParameters *videoCodecParams = nullptr, *audioCodecParams = nullptr;
+            const AVCodec *videoCodec = nullptr, *audioCodec = nullptr;
+        
+            for (unsigned int i = 0; i < formatContext->nb_streams; i++) {
+                if (formatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && videoStreamIndex == -1) {
+                    videoStreamIndex = i;
+                    videoCodecParams = formatContext->streams[i]->codecpar;
+                    videoCodec = avcodec_find_decoder(videoCodecParams->codec_id);
+                } else if (formatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && audioStreamIndex == -1) {
+                    audioStreamIndex = i;
+                    audioCodecParams = formatContext->streams[i]->codecpar;
+                    audioCodec = avcodec_find_decoder(audioCodecParams->codec_id);
+                }
+            }
+        
+            if (videoStreamIndex == -1) {
+                logError("No video stream found", videoName);
+                avformat_close_input(&formatContext);
+                return;
+            }
+        
+            AVCodecContext* videoCodecContext = avcodec_alloc_context3(videoCodec);
+            avcodec_parameters_to_context(videoCodecContext, videoCodecParams);
+            if (avcodec_open2(videoCodecContext, videoCodec, nullptr) < 0) {
+                logError("Failed to open video codec", videoName);
+                avcodec_free_context(&videoCodecContext);
+                avformat_close_input(&formatContext);
+                return;
+            }
+        
+            AVCodecContext* audioCodecContext = nullptr;
+            SwrContext* swrContext = nullptr;
+            if (audioStreamIndex != -1) {
+                audioCodecContext = avcodec_alloc_context3(audioCodec);
+                avcodec_parameters_to_context(audioCodecContext, audioCodecParams);
+                if (avcodec_open2(audioCodecContext, audioCodec, nullptr) < 0) {
+                    logError("Failed to open audio codec", videoName);
+                    avcodec_free_context(&audioCodecContext);
+                    audioStreamIndex = -1;
+                } else {
+                    AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO; // Целевая стерео-расположение
+                    swrContext = swr_alloc();
+                    if (!swrContext) {
+                        logError("Failed to allocate SwrContext", videoName);
+                        avcodec_free_context(&audioCodecContext);
+                        avformat_close_input(&formatContext);
+                        return;
+                    }
+                    // Используем swr_alloc_set_opts2 для настройки преобразования
+                    swr_alloc_set_opts2(&swrContext, &stereo, AV_SAMPLE_FMT_S16, 44100,
+                                        &audioCodecContext->ch_layout, audioCodecContext->sample_fmt, audioCodecContext->sample_rate,
+                                        0, nullptr);
+                    if (swr_init(swrContext) < 0) {
+                        logError("Failed to initialize SwrContext", videoName);
+                        swr_free(&swrContext);
+                        avcodec_free_context(&audioCodecContext);
+                        avformat_close_input(&formatContext);
+                        return;
+                    }
+                }
+            }
+        
+            SwsContext* swsContext = sws_getContext(videoCodecContext->width, videoCodecContext->height, videoCodecContext->pix_fmt,
+                                                    w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+        
+            AVFrame* videoFrame = av_frame_alloc();
+            AVFrame* rgbFrame = av_frame_alloc();
+            uint8_t* videoBuffer = (uint8_t*)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGBA, w, h, 1));
+            av_image_fill_arrays(rgbFrame->data, rgbFrame->linesize, videoBuffer, AV_PIX_FMT_RGBA, w, h, 1);
+        
+            AVFrame* audioFrame = av_frame_alloc();
+            std::vector<uint8_t> audioBuffer;
+            int audioChannel = -1;
+        
+            AVPacket packet;
+            SDL_Texture* videoTexture = nullptr;
+            VulcanImage videoVulkanImage;
+            std::string videoKey = "video_" + videoName;
+            double videoTimeBase = av_q2d(formatContext->streams[videoStreamIndex]->time_base);
+            double audioTimeBase = audioStreamIndex != -1 ? av_q2d(formatContext->streams[audioStreamIndex]->time_base) : 0;
+            int64_t lastVideoPts = AV_NOPTS_VALUE;
+        
+            if (!useVulkan) {
+                videoTexture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+            }
+        
+            while (isVideoPlaying && av_read_frame(formatContext, &packet) >= 0) {
+                if (currentState != GameState::GAME) {
+                    isVideoPlaying = false;
+                    break;
+                }
+        
+                if (packet.stream_index == videoStreamIndex) {
+                    if (avcodec_send_packet(videoCodecContext, &packet) == 0) {
+                        while (avcodec_receive_frame(videoCodecContext, videoFrame) == 0) {
+                            sws_scale(swsContext, videoFrame->data, videoFrame->linesize, 0, videoCodecContext->height, rgbFrame->data, rgbFrame->linesize);
+        
+                            if (useVulkan) {
+                                if (vulcanImages.find(videoKey) != vulcanImages.end()) {
+                                    vkDestroySampler(device, vulcanImages[videoKey].sampler, nullptr);
+                                    vkDestroyImageView(device, vulcanImages[videoKey].view, nullptr);
+                                    vkDestroyImage(device, vulcanImages[videoKey].image, nullptr);
+                                    vkFreeMemory(device, vulcanImages[videoKey].memory, nullptr);
+                                }
+                                vulcanImages[videoKey] = createVulcanImageFromRGB(rgbFrame->data[0], w, h);
+                                imagesToDisplay.clear();
+                                imagesToDisplay.push_back({videoKey, x, y, w, h});
+                            } else {
+                                SDL_UpdateTexture(videoTexture, nullptr, rgbFrame->data[0], rgbFrame->linesize[0]);
+                                SDL_Rect rect = {x, y, w, h};
+                                SDL_RenderClear(renderer);
+                                SDL_RenderCopy(renderer, videoTexture, nullptr, &rect);
+                                SDL_RenderPresent(renderer);
+                            }
+        
+                            if (lastVideoPts != AV_NOPTS_VALUE) {
+                                int64_t frameDelay = videoFrame->pts - lastVideoPts;
+                                SDL_Delay(static_cast<Uint32>(frameDelay * videoTimeBase * 1000));
+                            }
+                            lastVideoPts = videoFrame->pts;
+                        }
+                    }
+                } else if (packet.stream_index == audioStreamIndex && audioCodecContext) {
+                    if (avcodec_send_packet(audioCodecContext, &packet) == 0) {
+                        while (avcodec_receive_frame(audioCodecContext, audioFrame) == 0) {
+                            int outSamples = swr_convert(swrContext, nullptr, 0, (const uint8_t**)audioFrame->data, audioFrame->nb_samples);
+                            int bufferSize = av_samples_get_buffer_size(nullptr, 2, outSamples, AV_SAMPLE_FMT_S16, 1);
+                            audioBuffer.resize(bufferSize);
+                            uint8_t* audioData = audioBuffer.data();
+                            swr_convert(swrContext, &audioData, outSamples, (const uint8_t**)audioFrame->data, audioFrame->nb_samples);
+        
+                            Mix_Chunk* audioChunk = Mix_QuickLoad_RAW(audioBuffer.data(), audioBuffer.size());
+                            if (audioChunk) {
+                                audioChannel = Mix_PlayChannel(-1, audioChunk, 0);
+                                if (audioChannel != -1) {
+                                    Mix_Volume(audioChannel, volume);
+                                } else {
+                                    Mix_FreeChunk(audioChunk);
+                                }
+                            }
+                        }
+                    }
+                }
+        
+                av_packet_unref(&packet);
+        
+                SDL_Event event;
+                while (SDL_PollEvent(&event)) {
+                    if (event.type == SDL_QUIT || (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)) {
+                        isVideoPlaying = false;
+                    }
+                }
+        
+                if (useVulkan) render();
+            }
+        
+            if (!useVulkan && videoTexture) SDL_DestroyTexture(videoTexture);
+            if (useVulkan && vulcanImages.find(videoKey) != vulcanImages.end()) {
+                vkDestroySampler(device, vulcanImages[videoKey].sampler, nullptr);
+                vkDestroyImageView(device, vulcanImages[videoKey].view, nullptr);
+                vkDestroyImage(device, vulcanImages[videoKey].image, nullptr);
+                vkFreeMemory(device, vulcanImages[videoKey].memory, nullptr);
+                vulcanImages.erase(videoKey);
+            }
+            av_free(videoBuffer);
+            av_frame_free(&rgbFrame);
+            av_frame_free(&videoFrame);
+            av_frame_free(&audioFrame);
+            sws_freeContext(swsContext);
+            if (swrContext) swr_free(&swrContext);
+            if (audioCodecContext) avcodec_free_context(&audioCodecContext);
             avcodec_free_context(&videoCodecContext);
             avformat_close_input(&formatContext);
-            return;
+        
+            isVideoPlaying = false;
         }
-
-        AVCodecContext* audioCodecContext = nullptr;
-        SwrContext* swrContext = nullptr;
-        if (audioStreamIndex != -1) {
-            audioCodecContext = avcodec_alloc_context3(audioCodec);
-            avcodec_parameters_to_context(audioCodecContext, audioCodecParams);
-            if (avcodec_open2(audioCodecContext, audioCodec, nullptr) < 0) {
-                logError("Failed to open audio codec", videoName);
-                avcodec_free_context(&audioCodecContext);
-                audioStreamIndex = -1;
-            } else {
-                swrContext = swr_alloc_set_opts(nullptr, AV_CH_LAYOUT_STEREO, AV_SAMPLE_FMT_S16, 44100,
-                                                audioCodecContext->channel_layout, audioCodecContext->sample_fmt, audioCodecContext->sample_rate,
-                                                0, nullptr);
-                swr_init(swrContext);
-            }
-        }
-        
-        SwsContext* swsContext = sws_getContext(videoCodecContext->width, videoCodecContext->height, videoCodecContext->pix_fmt,
-                                                w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
-        
-        AVFrame* videoFrame = av_frame_alloc();
-        AVFrame* rgbFrame = av_frame_alloc();
-        uint8_t* videoBuffer = (uint8_t*)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGBA, w, h, 1));
-        av_image_fill_arrays(rgbFrame->data, rgbFrame->linesize, videoBuffer, AV_PIX_FMT_RGBA, w, h, 1);
-        
-        AVFrame* audioFrame = av_frame_alloc();
-        std::vector<uint8_t> audioBuffer;
-        int audioChannel = -1;
-        
-        AVPacket packet;
-        SDL_Texture* videoTexture = nullptr;
-        VulcanImage videoVulkanImage;
-        std::string videoKey = "video_" + videoName;
-        double videoTimeBase = av_q2d(formatContext->streams[videoStreamIndex]->time_base);
-        double audioTimeBase = audioStreamIndex != -1 ? av_q2d(formatContext->streams[audioStreamIndex]->time_base) : 0;
-        int64_t lastVideoPts = AV_NOPTS_VALUE;
-        
-        if (!useVulkan) {
-            videoTexture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING, w, h);
-        }
-        
-        while (isVideoPlaying && av_read_frame(formatContext, &packet) >= 0) {
-            if (currentState != GameState::GAME) {
-                isVideoPlaying = false;
-                break;
-            }
-        
-            if (packet.stream_index == videoStreamIndex) {
-                if (avcodec_send_packet(videoCodecContext, &packet) == 0) {
-                    while (avcodec_receive_frame(videoCodecContext, videoFrame) == 0) {
-                        sws_scale(swsContext, videoFrame->data, videoFrame->linesize, 0, videoCodecContext->height, rgbFrame->data, rgbFrame->linesize);
-        
-                        if (useVulkan) {
-                            if (vulcanImages.find(videoKey) != vulcanImages.end()) {
-                                vkDestroySampler(device, vulcanImages[videoKey].sampler, nullptr);
-                                vkDestroyImageView(device, vulcanImages[videoKey].view, nullptr);
-                                vkDestroyImage(device, vulcanImages[videoKey].image, nullptr);
-                                vkFreeMemory(device, vulcanImages[videoKey].memory, nullptr);
-                            }
-                            vulcanImages[videoKey] = createVulcanImageFromRGB(rgbFrame->data[0], w, h);
-                            imagesToDisplay.clear();
-                            imagesToDisplay.push_back({videoKey, x, y, w, h});
-                        } else {
-                            SDL_UpdateTexture(videoTexture, nullptr, rgbFrame->data[0], rgbFrame->linesize[0]);
-                            SDL_Rect rect = {x, y, w, h};
-                            SDL_RenderClear(renderer);
-                            SDL_RenderCopy(renderer, videoTexture, nullptr, &rect);
-                            SDL_RenderPresent(renderer);
-                        }
-        
-                        if (lastVideoPts != AV_NOPTS_VALUE) {
-                            int64_t frameDelay = videoFrame->pts - lastVideoPts;
-                            SDL_Delay(static_cast<Uint32>(frameDelay * videoTimeBase * 1000));
-                        }
-                        lastVideoPts = videoFrame->pts;
-                    }
-                }
-            } else if (packet.stream_index == audioStreamIndex && audioCodecContext) {
-                if (avcodec_send_packet(audioCodecContext, &packet) == 0) {
-                    while (avcodec_receive_frame(audioCodecContext, audioFrame) == 0) {
-                        int outSamples = swr_convert(swrContext, nullptr, 0, (const uint8_t**)audioFrame->data, audioFrame->nb_samples);
-                        int bufferSize = av_samples_get_buffer_size(nullptr, 2, outSamples, AV_SAMPLE_FMT_S16, 1);
-                        audioBuffer.resize(bufferSize);
-                        swr_convert(swrContext, &audioBuffer.data(), outSamples, (const uint8_t**)audioFrame->data, audioFrame->nb_samples);
-        
-                        Mix_Chunk* audioChunk = Mix_QuickLoad_RAW(audioBuffer.data(), audioBuffer.size());
-                        if (audioChunk) {
-                            audioChannel = Mix_PlayChannel(-1, audioChunk, 0);
-                            if (audioChannel != -1) {
-                                Mix_Volume(audioChannel, volume);
-                            } else {
-                                Mix_FreeChunk(audioChunk);
-                            }
-                        }
-                    }
-                }
-            }
-        
-            av_packet_unref(&packet);
-        
-            SDL_Event event;
-            while (SDL_PollEvent(&event)) {
-                if (event.type == SDL_QUIT || (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)) {
-                    isVideoPlaying = false;
-                }
-            }
-        
-            if (useVulkan) render();
-        }
-        
-        if (!useVulkan && videoTexture) SDL_DestroyTexture(videoTexture);
-        if (useVulkan && vulcanImages.find(videoKey) != vulcanImages.end()) {
-            vkDestroySampler(device, vulcanImages[videoKey].sampler, nullptr);
-            vkDestroyImageView(device, vulcanImages[videoKey].view, nullptr);
-            vkDestroyImage(device, vulcanImages[videoKey].image, nullptr);
-            vkFreeMemory(device, vulcanImages[videoKey].memory, nullptr);
-            vulcanImages.erase(videoKey);
-        }
-        av_free(videoBuffer);
-        av_frame_free(&rgbFrame);
-        av_frame_free(&videoFrame);
-        av_frame_free(&audioFrame);
-        sws_freeContext(swsContext);
-        if (swrContext) swr_free(&swrContext);
-        if (audioCodecContext) avcodec_free_context(&audioCodecContext);
-        avcodec_free_context(&videoCodecContext);
-        avformat_close_input(&formatContext);
-        
-        isVideoPlaying = false;
-            }
         
             void GSetImageEffect(const std::string& imageName, const std::string& effect) {
                 std::lock_guard<std::mutex> lock(renderMutex);
