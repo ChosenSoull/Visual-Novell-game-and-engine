@@ -1,175 +1,147 @@
-VisualNovelEngine
+# VisualNovelEngine
 
-VisualNovelEngine — это движок для создания визуальных новелл с поддержкой графики (Vulkan/OpenGL), звука, видео, скриптов и системы сохранений. Движок поддерживает состояния игры (MENU, GAME, PAUSE), позволяя приостанавливать текст и видео в паузе, сохраняя при этом воспроизведение фоновой музыки.
-Требования
+`VisualNovelEngine` — это движок для создания визуальных новелл с поддержкой графики (Vulkan/OpenGL), звука, видео и системы сохранений. Управление игрой осуществляется через C++ код, без использования внешних скриптов. Движок поддерживает состояния (`MENU`, `GAME`, `PAUSE`), приостанавливая текст и видео в паузе, сохраняя воспроизведение музыки.
 
-    Библиотеки:
-        SDL2 (SDL2, SDL2_ttf, SDL2_image, SDL2_mixer)
-        FFmpeg (libavcodec, libavformat, libavutil, libswscale, libswresample)
-        SQLite3
-        Vulkan SDK (опционально, для Vulkan-рендеринга)
-        GLAD (опционально, для OpenGL-рендеринга)
-        nlohmann/json (JSON для C++)
-    Компилятор: C++17 или новее (например, g++, clang++, MSVC).
-    Файлы ресурсов:
-        Изображения (.png, .jpg)
-        Звуки (.wav)
-        Музыка (.mp3)
-        Видео (.mp4)
-        Шрифт (font.ttf)
-        Шейдеры для Vulkan (vert.spv, frag.spv)
+## Требования
 
-Команда компилирования
+- **Библиотеки:**
+  - SDL2 (`SDL2`, `SDL2_ttf`, `SDL2_image`, `SDL2_mixer`)
+  - FFmpeg (`libavcodec`, `libavformat`, `libavutil`, `libswscale`, `libswresample`)
+  - SQLite3
+  - Vulkan SDK (для Vulkan-рендеринга)
+  - GLAD (для OpenGL-рендеринга)
 
-Для компиляции с использованием g++ выполните следующую команду (предполагается, что все зависимости установлены):
-bash
+- **Компилятор:** C++17 или новее (`g++`, `clang++`, `MSVC`).
+
+- **Файлы ресурсов:**
+  - Изображения (`.png`, `.jpg`)
+  - Звуки (`.wav`)
+  - Музыка (`.mp3`)
+  - Видео (`.mp4`)
+  - Шрифт (`font.ttf`)
+  - Шейдеры GLSL (`shader.vert`, `shader.frag`) для Vulkan
+
+## Команда компилирования
+
+### Linux
+1. Скомпилируйте шейдеры для Vulkan:
+   ```bash
+   glslc shader.vert -o vert.spv
+   glslc shader.frag -o frag.spv
+
+    Скомпилируйте движок:
+    bash
+
 g++ -std=c++17 engine.c -o VisualNovelEngine \
     -I/usr/include/SDL2 -lSDL2 -lSDL2_ttf -lSDL2_image -lSDL2_mixer \
     -lavcodec -lavformat -lavutil -lswscale -lswresample \
-    -lsqlite3 -lvulkan -lGL -lGLU -lGLEW \
+    -lsqlite3 -lvulkan \
     -pthread
-Пояснения:
+Для OpenGL замените -lvulkan на -lGL -lGLU -lGLEW.
+(Опционально) Укажите рендеринг через переменную окружения:
+bash
 
-    -std=c++17: Используется стандарт C++17.
-    -I/usr/include/SDL2: Путь к заголовкам SDL2 (может отличаться в зависимости от системы).
-    -l<библиотека>: Подключение библиотек.
-    -pthread: Поддержка многопоточности.
-    Файл engine.c содержит весь код движка (в данном случае расширение .c используется условно, так как код написан на C++).
+    export RENDER_API=opengl  # или vulkan (по умолчанию)
+    ./VisualNovelEngine
 
-Для OpenGL вместо Vulkan замените -lvulkan на -lGL -lGLU -lGLEW и укажите false в конструкторе VisualNovelEngine.
-Примечание:
+Windows
 
-    Убедитесь, что пути к библиотекам и заголовкам соответствуют вашей системе (например, на Windows может потребоваться MSYS2 или другая настройка).
-    Шейдеры (vert.spv, frag.spv) нужно скомпилировать из GLSL с помощью glslc:
-    bash
+    Скомпилируйте шейдеры для Vulkan (требуется Vulkan SDK):
+    cmd
 
-    glslc shader.vert -o vert.spv
-    glslc shader.frag -o frag.spv
+glslc shader.vert -o vert.spv
+glslc shader.frag -o frag.spv
+Скомпилируйте движок (пример для MSYS2/MinGW):
+cmd
+
+    g++ -std=c++17 engine.c -o VisualNovelEngine.exe \
+        -I"C:\SDL2\include" -L"C:\SDL2\lib" -lSDL2 -lSDL2_ttf -lSDL2_image -lSDL2_mixer \
+        -lavcodec -lavformat -lavutil -lswscale -lswresample \
+        -lsqlite3 -lvulkan-1 \
+        -pthread
+    Укажите правильные пути к библиотекам. Для OpenGL замените -lvulkan-1 на -lopengl32 -lglu32 -lglew32.
 
 Запуск
-
-После компиляции запустите программу:
 bash
-./VisualNovelEngine
+./VisualNovelEngine  # Linux
+VisualNovelEngine.exe  # Windows
+Конфигурация
+
+Движок использует файл config.ini для выбора рендеринга, расположенный в:
+
+    Linux: ~/Documents/NovelGame/config.ini
+    Windows: %USERPROFILE%\Documents\NovelGame\config.ini
+
+Если файл отсутствует, он создается автоматически с настройкой по умолчанию:
+text
+[Rendering]
+api=vulkan
+Поддерживаемые значения api:
+
+    vulkan (по умолчанию)
+    opengl
+
+В Linux также можно переопределить рендеринг через переменную окружения RENDER_API.
+Сохранения
+
+Сохранения хранятся в базе данных SQLite savegame.db в той же папке:
+
+    Linux: ~/Documents/NovelGame/savegame.db
+    Windows: %USERPROFILE%\Documents\NovelGame\savegame.db
+
 Структура проекта
 
-    engine.c: Основной файл с кодом движка.
-    script.txt: Файл скрипта для управления сюжетом.
+    engine.c: Основной файл с кодом движка (C++).
+    shader.vert, shader.frag: Исходные шейдеры для Vulkan.
     Ресурсы (изображения, звуки, музыка, видео) должны быть в рабочей директории.
 
 Описание публичных функций
-
-Движок предоставляет следующие публичные методы для создания визуальной новеллы:
 Конструктор и запуск
 
-    VisualNovelEngine(bool useVulkan_ = true)
-        Конструктор движка.
-        Параметры:
-            useVulkan_: Если true, используется Vulkan, иначе OpenGL.
-        Пример: VisualNovelEngine engine(true);
+    VisualNovelEngine()
+        Конструктор движка. Автоматически определяет API рендеринга из config.ini или RENDER_API.
+        Пример: VisualNovelEngine engine;
     bool start()
-        Запускает движок, инициализирует графику, звук и основной цикл.
-        Возвращает: true при успешном запуске, false при ошибке.
+        Запускает движок и игровой цикл.
+        Возвращает: true при успехе, false при ошибке.
         Пример: engine.start();
 
 Графические функции
 
     void GShowImage(const std::string& imageName, int x, int y, int w, int h)
-        Отображает изображение на экране.
-        Параметры:
-            imageName: Имя файла изображения (без расширения, ожидается .png или .jpg).
-            x, y: Координаты верхнего левого угла.
-            w, h: Ширина и высота изображения.
+        Отображает изображение.
+        Параметры: imageName (без расширения), x, y (координаты), w, h (размеры).
         Пример: engine.GShowImage("background", 0, 0, 1920, 1080);
     void GTextToScreen(const std::string& text, const std::string& fontName, int x, int y, SDL_Color color, const std::string& backgroundImage = "")
-        Выводит текст на экран с опциональным фоном.
-        Параметры:
-            text: Отображаемый текст.
-            fontName: Имя шрифта (например, "default", ожидается font.ttf).
-            x, y: Координаты текста.
-            color: Цвет текста в формате {r, g, b, a} (например, {255, 255, 255, 255} для белого).
-            backgroundImage: Опциональное имя фонового изображения (без расширения).
+        Выводит текст с опциональным фоном.
         Пример: engine.GTextToScreen("Hello!", "default", 100, 900, {255, 255, 255, 255}, "dialog_bg");
     void GClearScreen()
-        Очищает экран от всех отображаемых объектов (изображений и текста).
+        Очищает экран.
         Пример: engine.GClearScreen();
-    void GSetImageEffect(const std::string& imageName, const std::string& effect)
-        Применяет эффект к изображению (заглушка, пока поддерживает только "fade").
-        Параметры:
-            imageName: Имя изображения.
-            effect: Название эффекта (например, "fade").
-        Пример: engine.GSetImageEffect("background", "fade");
     void GPlayVideo(const std::string& videoName, int x = 0, int y = 0, int w = 1920, int h = 1080)
-        Воспроизводит видео с аудио.
-        Параметры:
-            videoName: Имя файла видео (без расширения, ожидается .mp4).
-            x, y: Координаты видео (по умолчанию 0, 0).
-            w, h: Размеры видео (по умолчанию 1920x1080).
-        Примечание: Видео останавливается в состоянии PAUSE.
-        Пример: engine.GPlayVideo("intro", 0, 0, 1920, 1080);
+        Воспроизводит видео. Останавливается в PAUSE.
+        Пример: engine.GPlayVideo("intro");
 
 Аудио-функции
 
     void MPlaySound(const std::string& soundName)
-        Воспроизводит звуковой эффект.
-        Параметры:
-            soundName: Имя файла звука (без расширения, ожидается .wav).
+        Воспроизводит звук.
         Пример: engine.MPlaySound("click");
     void MPlayBackgroundMusic(const std::string& musicName, int loops = -1)
-        Воспроизводит фоновую музыку.
-        Параметры:
-            musicName: Имя файла музыки (без расширения, ожидается .mp3).
-            loops: Количество повторов (-1 для бесконечного воспроизведения).
-        Примечание: Музыка продолжает играть в состоянии PAUSE.
+        Воспроизводит музыку (работает в PAUSE).
         Пример: engine.MPlayBackgroundMusic("bgm", -1);
     void MStopBackgroundMusic()
-        Останавливает воспроизведение фоновой музыки.
+        Останавливает музыку.
         Пример: engine.MStopBackgroundMusic();
     void MSetVolume(int newVolume)
-        Устанавливает громкость звука.
-        Параметры:
-            newVolume: Значение громкости (0–MIX_MAX_VOLUME, обычно 128).
+        Устанавливает громкость (0–128).
         Пример: engine.MSetVolume(64);
 
 Сохранение и загрузка
 
     void SSaveGame(int slot = 1)
-        Сохраняет текущее состояние игры в указанный слот.
-        Параметры:
-            slot: Номер слота сохранения (по умолчанию 1).
-        Сохраняет: Позицию в скрипте, отображаемые изображения, переменные.
+        Сохраняет игру в слот.
         Пример: engine.SSaveGame(1);
     void SLoadGame(int slot = 1)
-        Загружает состояние игры из указанного слота.
-        Параметры:
-            slot: Номер слота загрузки (по умолчанию 1).
+        Загружает игру из слота.
         Пример: engine.SLoadGame(1);
-
-Управление состояниями
-
-Движок автоматически обрабатывает состояния:
-
-    MENU: Отображает главное меню ("Start Game", "Exit").
-    GAME: Выполняет скрипт, отображает текст, изображения, видео.
-    PAUSE: Приостанавливает текст и видео, сохраняя музыку.
-
-Переходы:
-
-    Из MENU в GAME: Клик по "Start Game".
-    Из GAME в PAUSE: Нажатие ESC.
-    Из PAUSE в GAME: Нажатие ESC.
-    Из PAUSE в MENU: Клик по "Main Menu".
-
-Пример скрипта (script.txt)
-text
-show image background 0 0 1920 1080
-say Hello, welcome to the game!
-play music bgm
-play video intro
-clear
-say Goodbye!
-Дополнительные заметки
-
-    Ресурсы загружаются асинхронно в отдельном потоке.
-    Для Vulkan требуется наличие скомпилированных шейдеров (vert.spv, frag.spv).
-    Ошибки логируются в консоль через logError.

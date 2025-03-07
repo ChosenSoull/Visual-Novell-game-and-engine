@@ -19,7 +19,7 @@
 #include <sstream>
 #include <chrono>
 #include <queue>
-#include <nlohmann/json.hpp>
+#include <filesystem>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -28,8 +28,6 @@ extern "C" {
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 }
-
-using json = nlohmann::json;
 
 struct VulcanImage {
     VkImage image;
@@ -55,16 +53,12 @@ struct DisplayImage {
 
 class VisualNovelEngine {
 private:
-    enum class GameState {
-        MENU,
-        GAME,
-        PAUSE
-    };
+    enum class GameState { MENU, GAME, PAUSE };
     GameState currentState = GameState::MENU;
 
-    bool isRunning;
-    bool useVulkan;
-    int volume, pan;
+    bool isRunning = false;
+    bool useVulkan = true; // По умолчанию Vulkan
+    int volume = MIX_MAX_VOLUME / 2, pan = 128;
     SDL_Window* window = nullptr;
     SDL_Renderer* renderer = nullptr;
     SDL_GLContext glContext;
@@ -92,12 +86,6 @@ private:
     std::map<std::string, SDL_Surface*> loadedSurfaces;
     std::map<std::string, VulcanImage> vulcanImages;
     std::queue<std::string> loadQueue;
-    std::vector<std::string> script;
-    std::map<std::string, size_t> scriptLabels;
-    size_t currentCommand = 0;
-    bool advanceStory = false;
-    bool isWaitingForInput = false;
-    bool isVideoPlaying = false;
     std::vector<DisplayImage> imagesToDisplay;
     std::vector<DisplayImage> menuImages;
     std::vector<DisplayImage> pauseImages;
@@ -115,7 +103,57 @@ private:
     std::vector<VkSemaphore> renderFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
     uint32_t currentFrameIndex = 0;
-    std::map<std::string, int> variables;
+    int storyStep = 0; // Переменная для управления сюжетом
+    bool advanceStory = false;
+    bool isVideoPlaying = false;
+
+    std::string getConfigPath() {
+        std::string path;
+#ifdef _WIN32
+        path = std::string(getenv("USERPROFILE")) + "\\Documents\\NovelGame";
+#else
+        path = std::string(getenv("HOME")) + "/Documents/NovelGame";
+#endif
+        std::filesystem::create_directory(path);
+        return path + "/config.ini";
+    }
+
+    std::string getSavePath() {
+        std::string path;
+#ifdef _WIN32
+        path = std::string(getenv("USERPROFILE")) + "\\Documents\\NovelGame";
+#else
+        path = std::string(getenv("HOME")) + "/Documents/NovelGame";
+#endif
+        std::filesystem::create_directory(path);
+        return path + "/savegame.db";
+    }
+
+    void loadConfig() {
+        std::string configPath = getConfigPath();
+        std::ifstream configFile(configPath);
+        if (!configFile.is_open()) {
+            std::ofstream out(configPath);
+            out << "[Rendering]\napi=vulkan\n";
+            out.close();
+            useVulkan = true;
+        } else {
+            std::string line;
+            while (std::getline(configFile, line)) {
+                if (line.find("api=") != std::string::npos) {
+                    std::string api = line.substr(4);
+                    useVulkan = (api == "vulkan");
+                }
+            }
+            configFile.close();
+        }
+#ifdef __linux__
+        const char* envApi = getenv("RENDER_API");
+        if (envApi) {
+            useVulkan = (std::string(envApi) == "vulkan");
+        }
+#endif
+    }
 
     void logError(const std::string& msg, const std::string& errorDetails) {
         std::cerr << "[ERROR] " << msg << ": " << errorDetails << std::endl;
@@ -862,15 +900,14 @@ private:
     }
 
     bool init() {
+        loadConfig();
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) return false;
         if (TTF_Init() == -1) return false;
         if (IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG) == 0) return false;
         if (Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2, 2048) < 0) return false;
-        Mix_Volume(-1, MIX_MAX_VOLUME / 2);
-        volume = MIX_MAX_VOLUME / 2;
-        pan = 128;
+        Mix_Volume(-1, volume);
 
-        if (sqlite3_open("savegame.db", &db) != SQLITE_OK) return false;
+        if (sqlite3_open(getSavePath().c_str(), &db) != SQLITE_OK) return false;
         const char* createTableSQL = "CREATE TABLE IF NOT EXISTS savegame (id INTEGER PRIMARY KEY, state TEXT);";
         char* errMsg = nullptr;
         if (sqlite3_exec(db, createTableSQL, nullptr, nullptr, &errMsg) != SQLITE_OK) {
@@ -882,7 +919,6 @@ private:
 
         isRunning = true;
         threads.emplace_back(&VisualNovelEngine::loadResources, this);
-        loadScript("script.txt");
         initMenu();
         return true;
     }
@@ -1070,9 +1106,7 @@ private:
     void handleEvents() {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) {
-                isRunning = false;
-            }
+            if (event.type == SDL_QUIT) isRunning = false;
 
             switch (currentState) {
                 case GameState::MENU:
@@ -1080,6 +1114,7 @@ private:
                         int x = event.button.x, y = event.button.y;
                         if (x >= 900 && x <= 1100 && y >= 500 && y <= 550) {
                             currentState = GameState::GAME;
+                            storyStep = 0;
                         } else if (x >= 900 && x <= 1000 && y >= 600 && y <= 650) {
                             isRunning = false;
                         }
@@ -1090,14 +1125,9 @@ private:
                     if (event.type == SDL_KEYDOWN) {
                         if (event.key.keysym.sym == SDLK_ESCAPE) {
                             currentState = GameState::PAUSE;
-                            if (isVideoPlaying) {
-                                isVideoPlaying = false;
-                            }
+                            if (isVideoPlaying) isVideoPlaying = false;
                             initPauseMenu();
-                        } else if (!isWaitingForInput) {
-                            advanceStory = true;
                         } else {
-                            isWaitingForInput = false;
                             advanceStory = true;
                         }
                     }
@@ -1107,13 +1137,14 @@ private:
                     if (event.type == SDL_KEYDOWN) {
                         if (event.key.keysym.sym == SDLK_ESCAPE) {
                             currentState = GameState::GAME;
-                        } else if (event.key.keysym.sym == SDLK_m) { // Пример смены музыки
+                        } else if (event.key.keysym.sym == SDLK_m) {
                             MPlayBackgroundMusic("pause_music", -1);
                         }
                     } else if (event.type == SDL_MOUSEBUTTONDOWN) {
                         int x = event.button.x, y = event.button.y;
                         if (x >= 900 && x <= 1100 && y >= 600 && y <= 650) {
                             currentState = GameState::MENU;
+                            storyStep = 0;
                         }
                     }
                     break;
@@ -1121,81 +1152,32 @@ private:
         }
     }
 
-    void executeCommand(const std::string& command) {
-        std::istringstream iss(command);
-        std::string cmdType;
-        iss >> cmdType;
-
-        if (cmdType == "show") {
-            std::string resourceType, resourceName;
-            int x, y, w, h;
-            iss >> resourceType >> resourceName >> x >> y >> w >> h;
-            if (resourceType == "image") {
-                GShowImage(resourceName, x, y, w, h);
-            }
-        } else if (cmdType == "say") {
-            std::string text;
-            std::getline(iss, text);
-            text = text.substr(text.find_first_not_of(" "));
-            GTextToScreen(text, "default", 100, 900, {255, 255, 255, 255}, "dialog_bg");
-            isWaitingForInput = true;
-        } else if (cmdType == "play") {
-            std::string resourceType, resourceName;
-            iss >> resourceType >> resourceName;
-            if (resourceType == "sound") {
-                MPlaySound(resourceName);
-            } else if (resourceType == "music") {
-                MPlayBackgroundMusic(resourceName);
-            } else if (resourceType == "video") {
-                int x = 0, y = 0, w = 1920, h = 1080;
-                if (iss >> x >> y >> w >> h) {
-                    GPlayVideo(resourceName, x, y, w, h);
-                } else {
-                    GPlayVideo(resourceName);
-                }
-                isWaitingForInput = true;
-            }
-        } else if (cmdType == "stop_music") {
-            MStopBackgroundMusic();
-        } else if (cmdType == "volume") {
-            int vol;
-            iss >> vol;
-            MSetVolume(vol);
-        } else if (cmdType == "clear") {
-            GClearScreen();
-        }
-    }
-
-    void loadScript(const std::string& filename) {
-        std::ifstream file(filename);
-        if (!file.is_open()) return;
-        script.clear();
-        scriptLabels.clear();
-        std::string line;
-        size_t lineNum = 0;
-        while (std::getline(file, line)) {
-            script.push_back(line);
-            std::istringstream iss(line);
-            std::string cmdType;
-            iss >> cmdType;
-            if (cmdType == "label") {
-                std::string labelName;
-                iss >> labelName;
-                scriptLabels[labelName] = lineNum;
-            }
-            lineNum++;
-        }
-        file.close();
-    }
-
     void run() {
         while (isRunning) {
             handleEvents();
 
-            if (currentState == GameState::GAME && advanceStory && currentCommand < script.size()) {
-                executeCommand(script[currentCommand]);
-                if (!isWaitingForInput) {
-                    currentCommand++;
+            if (currentState == GameState::GAME) {
+                // Управление сюжетом через C++
+                if (storyStep == 0) {
+                    GShowImage("background", 0, 0, 1920, 1080);
+                    GTextToScreen("Welcome to the game!", "default", 100, 900, {255, 255, 255, 255}, "dialog_bg");
+                    MPlayBackgroundMusic("bgm", -1);
+                    storyStep++;
+                } else if (storyStep == 1 && advanceStory) {
+                    GClearScreen();
+                    GShowImage("character", 500, 300, 800, 600);
+                    GTextToScreen("Let's begin!", "default", 100, 900, {255, 255, 255, 255}, "dialog_bg");
+                    storyStep++;
+                    advanceStory = false;
+                } else if (storyStep == 2 && advanceStory) {
+                    GPlayVideo("intro");
+                    storyStep++;
+                    advanceStory = false;
+                } else if (storyStep == 3 && advanceStory) {
+                    GClearScreen();
+                    GTextToScreen("Goodbye!", "default", 100, 900, {255, 255, 255, 255}, "dialog_bg");
+                    MStopBackgroundMusic();
+                    storyStep++;
                     advanceStory = false;
                 }
             }
@@ -1257,11 +1239,11 @@ private:
     }
 
 public:
-    VisualNovelEngine(bool useVulkan_ = true) : isRunning(false), useVulkan(useVulkan_) {}
+    VisualNovelEngine() { init(); }
     ~VisualNovelEngine() { cleanup(); }
 
     bool start() {
-        if (!init()) return false;
+        if (!isRunning) return false;
         run();
         return true;
     }
@@ -1351,19 +1333,19 @@ public:
                 swr_init(swrContext);
             }
         }
-
+        
         SwsContext* swsContext = sws_getContext(videoCodecContext->width, videoCodecContext->height, videoCodecContext->pix_fmt,
                                                 w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
-
+        
         AVFrame* videoFrame = av_frame_alloc();
         AVFrame* rgbFrame = av_frame_alloc();
         uint8_t* videoBuffer = (uint8_t*)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGBA, w, h, 1));
         av_image_fill_arrays(rgbFrame->data, rgbFrame->linesize, videoBuffer, AV_PIX_FMT_RGBA, w, h, 1);
-
+        
         AVFrame* audioFrame = av_frame_alloc();
         std::vector<uint8_t> audioBuffer;
         int audioChannel = -1;
-
+        
         AVPacket packet;
         SDL_Texture* videoTexture = nullptr;
         VulcanImage videoVulkanImage;
@@ -1371,22 +1353,22 @@ public:
         double videoTimeBase = av_q2d(formatContext->streams[videoStreamIndex]->time_base);
         double audioTimeBase = audioStreamIndex != -1 ? av_q2d(formatContext->streams[audioStreamIndex]->time_base) : 0;
         int64_t lastVideoPts = AV_NOPTS_VALUE;
-
+        
         if (!useVulkan) {
             videoTexture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING, w, h);
         }
-
+        
         while (isVideoPlaying && av_read_frame(formatContext, &packet) >= 0) {
             if (currentState != GameState::GAME) {
                 isVideoPlaying = false;
                 break;
             }
-
+        
             if (packet.stream_index == videoStreamIndex) {
                 if (avcodec_send_packet(videoCodecContext, &packet) == 0) {
                     while (avcodec_receive_frame(videoCodecContext, videoFrame) == 0) {
                         sws_scale(swsContext, videoFrame->data, videoFrame->linesize, 0, videoCodecContext->height, rgbFrame->data, rgbFrame->linesize);
-
+        
                         if (useVulkan) {
                             if (vulcanImages.find(videoKey) != vulcanImages.end()) {
                                 vkDestroySampler(device, vulcanImages[videoKey].sampler, nullptr);
@@ -1404,7 +1386,7 @@ public:
                             SDL_RenderCopy(renderer, videoTexture, nullptr, &rect);
                             SDL_RenderPresent(renderer);
                         }
-
+        
                         if (lastVideoPts != AV_NOPTS_VALUE) {
                             int64_t frameDelay = videoFrame->pts - lastVideoPts;
                             SDL_Delay(static_cast<Uint32>(frameDelay * videoTimeBase * 1000));
@@ -1419,7 +1401,7 @@ public:
                         int bufferSize = av_samples_get_buffer_size(nullptr, 2, outSamples, AV_SAMPLE_FMT_S16, 1);
                         audioBuffer.resize(bufferSize);
                         swr_convert(swrContext, &audioBuffer.data(), outSamples, (const uint8_t**)audioFrame->data, audioFrame->nb_samples);
-
+        
                         Mix_Chunk* audioChunk = Mix_QuickLoad_RAW(audioBuffer.data(), audioBuffer.size());
                         if (audioChunk) {
                             audioChannel = Mix_PlayChannel(-1, audioChunk, 0);
@@ -1432,19 +1414,19 @@ public:
                     }
                 }
             }
-
+        
             av_packet_unref(&packet);
-
+        
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
                 if (event.type == SDL_QUIT || (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)) {
                     isVideoPlaying = false;
                 }
             }
-
+        
             if (useVulkan) render();
         }
-
+        
         if (!useVulkan && videoTexture) SDL_DestroyTexture(videoTexture);
         if (useVulkan && vulcanImages.find(videoKey) != vulcanImages.end()) {
             vkDestroySampler(device, vulcanImages[videoKey].sampler, nullptr);
@@ -1462,91 +1444,94 @@ public:
         if (audioCodecContext) avcodec_free_context(&audioCodecContext);
         avcodec_free_context(&videoCodecContext);
         avformat_close_input(&formatContext);
-
+        
         isVideoPlaying = false;
-    }
-
-    void GSetImageEffect(const std::string& imageName, const std::string& effect) {
-        std::lock_guard<std::mutex> lock(renderMutex);
-        // Заглушка для эффектов (например, fade)
-        if (effect == "fade") {
-            logError("Fade effect not implemented yet", imageName);
-        }
-    }
-
-    void MPlaySound(const std::string& soundName) {
-        std::lock_guard<std::mutex> lock(renderMutex);
-        if (sounds.find(soundName) != sounds.end()) {
-            int channel = Mix_PlayChannel(-1, sounds[soundName], 0);
-            if (channel != -1) {
-                Mix_Volume(channel, volume);
-                Mix_SetPanning(channel, pan, 255 - pan);
             }
-        } else {
-            loadQueue.push(soundName);
-        }
-    }
-
-    void MPlayBackgroundMusic(const std::string& musicName, int loops = -1) {
-        std::lock_guard<std::mutex> lock(renderMutex);
-        if (music.find(musicName) != music.end()) {
-            Mix_PlayMusic(music[musicName], loops);
-        } else {
-            loadQueue.push(musicName);
-        }
-    }
-
-    void MStopBackgroundMusic() {
-        Mix_HaltMusic();
-    }
-
-    void MSetVolume(int newVolume) {
-        volume = std::clamp(newVolume, 0, MIX_MAX_VOLUME);
-        Mix_Volume(-1, volume);
-    }
-
-    void SSaveGame(int slot = 1) {
-        std::lock_guard<std::mutex> lock(renderMutex);
-        json saveData;
-        saveData["command"] = currentCommand;
-        saveData["images"] = json::array();
-        for (const auto& img : imagesToDisplay) {
-            saveData["images"].push_back({{"name", img.name}, {"x", img.x}, {"y", img.y}, {"w", img.w}, {"h", img.h}});
-        }
-        saveData["variables"] = variables;
-
-        std::string saveString = saveData.dump();
-        std::string sql = "INSERT OR REPLACE INTO savegame (id, state) VALUES (" + std::to_string(slot) + ", ?)";
-        sqlite3_stmt* stmt;
-        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, saveString.c_str(), -1, SQLITE_STATIC);
-            sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
-        }
-    }
-
-    void SLoadGame(int slot = 1) {
-        std::lock_guard<std::mutex> lock(renderMutex);
-        std::string sql = "SELECT state FROM savegame WHERE id = " + std::to_string(slot);
-        sqlite3_stmt* stmt;
-        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
-            if (sqlite3_step(stmt) == SQLITE_ROW) {
-                std::string saveString = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-                json saveData = json::parse(saveString);
-                currentCommand = saveData["command"];
-                imagesToDisplay.clear();
-                for (const auto& img : saveData["images"]) {
-                    imagesToDisplay.push_back({img["name"], img["x"], img["y"], img["w"], img["h"]});
+        
+            void GSetImageEffect(const std::string& imageName, const std::string& effect) {
+                std::lock_guard<std::mutex> lock(renderMutex);
+                // Заглушка для эффектов (например, fade)
+                if (effect == "fade") {
+                    logError("Fade effect not implemented yet", imageName);
                 }
-                variables = saveData["variables"].get<std::map<std::string, int>>();
             }
-            sqlite3_finalize(stmt);
-        }
-    }
-};
-
+        
+            void MPlaySound(const std::string& soundName) {
+                std::lock_guard<std::mutex> lock(renderMutex);
+                if (sounds.find(soundName) != sounds.end()) {
+                    int channel = Mix_PlayChannel(-1, sounds[soundName], 0);
+                    if (channel != -1) {
+                        Mix_Volume(channel, volume);
+                        Mix_SetPanning(channel, pan, 255 - pan);
+                    }
+                } else {
+                    loadQueue.push(soundName);
+                }
+            }
+        
+            void MPlayBackgroundMusic(const std::string& musicName, int loops = -1) {
+                std::lock_guard<std::mutex> lock(renderMutex);
+                if (music.find(musicName) != music.end()) {
+                    Mix_PlayMusic(music[musicName], loops);
+                } else {
+                    loadQueue.push(musicName);
+                }
+            }
+        
+            void MStopBackgroundMusic() {
+                Mix_HaltMusic();
+            }
+        
+            void MSetVolume(int newVolume) {
+                volume = std::clamp(newVolume, 0, MIX_MAX_VOLUME);
+                Mix_Volume(-1, volume);
+            }
+        
+            void SSaveGame(int slot = 1) {
+                std::lock_guard<std::mutex> lock(renderMutex);
+                std::ostringstream saveData;
+                saveData << storyStep << "\n";
+                for (const auto& img : imagesToDisplay) {
+                    saveData << img.name << " " << img.x << " " << img.y << " " << img.w << " " << img.h << "\n";
+                }
+        
+                std::string saveString = saveData.str();
+                std::string sql = "INSERT OR REPLACE INTO savegame (id, state) VALUES (" + std::to_string(slot) + ", ?)";
+                sqlite3_stmt* stmt;
+                if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                    sqlite3_bind_text(stmt, 1, saveString.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_step(stmt);
+                    sqlite3_finalize(stmt);
+                }
+            }
+        
+            void SLoadGame(int slot = 1) {
+                std::lock_guard<std::mutex> lock(renderMutex);
+                std::string sql = "SELECT state FROM savegame WHERE id = " + std::to_string(slot);
+                sqlite3_stmt* stmt;
+                if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                    if (sqlite3_step(stmt) == SQLITE_ROW) {
+                        std::string saveString = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                        std::istringstream iss(saveString);
+                        iss >> storyStep;
+                        imagesToDisplay.clear();
+                        std::string line;
+                        std::getline(iss, line); // Пропустить первую строку (storyStep)
+                        while (std::getline(iss, line)) {
+                            std::istringstream lineStream(line);
+                            std::string name;
+                            int x, y, w, h;
+                            lineStream >> name >> x >> y >> w >> h;
+                            imagesToDisplay.push_back({name, x, y, w, h});
+                        }
+                    }
+                    sqlite3_finalize(stmt);
+                }
+            }
+        };
+        
 int main() {
-    VisualNovelEngine engine(true); // Использовать Vulkan
+    VisualNovelEngine engine;
     if (!engine.start()) {
         std::cerr << "Engine failed to start" << std::endl;
         return 1;
