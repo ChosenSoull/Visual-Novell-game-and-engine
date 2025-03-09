@@ -1,2 +1,11 @@
 .vscode/
 files/
+Makefile
+.qmake.stash
+moc_predefs.h
+GameCreatorUI.moc
+GameCreatorUI.o
+VisualNovelEngine.o
+opengl.o 
+vulkan.o
+saves.o
